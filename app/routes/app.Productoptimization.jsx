@@ -175,15 +175,18 @@ export async function loader({ request }) {
   try {
     const products = await getAllProducts(admin);
 
-    const processedProducts = await Promise.all(
-      products.map(async (product) => {
+    const processedProducts = products.map((product) => {
         const images = product.images.edges.map(edge => edge.node);
         const optimizationData = calculateOptimizationScore(product);
-        
+
         let totalOriginalSize = 0;
         let totalOptimizedSize = 0;
 
-        // Get actual sizes - check metafields first, then fetch if needed
+        // Use sizes already measured during optimization (stored in metafields).
+        // We intentionally do NOT download image files here: the previous version
+        // fetched every un-optimized image from the CDN on every page load, which
+        // made this screen extremely slow (hundreds of network requests per view).
+        // Real sizes are recorded when a product is optimized via the action below.
         for (const image of images) {
           const imageKey = `image_${image.id.split('/').pop()}`;
           const metafield = product.metafields.edges.find(
@@ -198,10 +201,6 @@ export async function loader({ request }) {
             } catch (e) {
               console.error('Error parsing metafield:', e);
             }
-          } else {
-            // Fetch actual size if not in metafield
-            const actualSize = await getActualImageSize(image.url);
-            totalOriginalSize += actualSize;
           }
         }
 
@@ -221,8 +220,7 @@ export async function loader({ request }) {
           featuredImageUrl: product.featuredImage?.url || images[0]?.url,
           needsOptimization: optimizationData.score < 70
         };
-      })
-    );
+    });
 
     // Apply filters
     let filteredProducts = processedProducts;
@@ -303,7 +301,7 @@ async function optimizeImage(imageUrl, format) {
           fit: 'inside', 
           withoutEnlargement: true 
         })
-        .webp({ quality: 85, effort: 6 })
+        .webp({ quality: 85, effort: 4 })
         .toBuffer();
     } else {
       // Optimize JPEG
