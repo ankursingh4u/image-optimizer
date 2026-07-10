@@ -13,7 +13,7 @@ import {
   Badge,
   Divider,
 } from "@shopify/polaris";
-import { authenticate, BASIC_PLAN } from "../shopify.server";
+import { authenticate } from "../shopify.server";
 
 // Import Polaris styles - THIS IS CRITICAL
 import "@shopify/polaris/build/esm/styles.css";
