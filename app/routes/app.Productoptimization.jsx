@@ -45,14 +45,17 @@ async function fetchAllProducts(admin, cursor = null) {
               width
               height
             }
-            images(first: 250) {
+            media(first: 250) {
               edges {
                 node {
-                  id
-                  url
-                  altText
-                  width
-                  height
+                  mediaContentType
+                  ... on MediaImage {
+                    id
+                    alt
+                    image {
+                      url
+                    }
+                  }
                 }
               }
             }
@@ -87,6 +90,20 @@ async function getAllProducts(admin) {
   while (hasNextPage) {
     const data = await fetchAllProducts(admin, cursor);
     const products = data.data.products.edges.map(edge => edge.node);
+    // Normalize the media connection into the { images: { edges } } shape the
+    // rest of this file expects. We use MediaImage ids here so they match the
+    // ids we write optimization metafields against during the action.
+    for (const p of products) {
+      const mediaNodes = (p.media?.edges || [])
+        .map(e => e.node)
+        .filter(n => n && n.mediaContentType === 'IMAGE' && n.image && n.image.url);
+      p.images = {
+        edges: mediaNodes.map(n => ({
+          node: { id: n.id, url: n.image.url, altText: n.alt || '' },
+        })),
+      };
+      delete p.media;
+    }
     allProducts = [...allProducts, ...products];
 
     hasNextPage = data.data.products.pageInfo.hasNextPage;
@@ -330,102 +347,101 @@ async function optimizeImage(imageUrl, format) {
 }
 
 /**
- * Delete old image from Shopify
+ * Upload the optimized image to Shopify via the current GraphQL Admin API and
+ * replace the original. Flow: stagedUploadsCreate -> upload bytes to the staged
+ * target -> productCreateMedia -> productDeleteMedia (old image).
+ *
+ * Returns the new MediaImage gid.
  */
-async function deleteImage(admin, productId, imageId) {
-  try {
-    const deleteMutation = `#graphql
-      mutation productDeleteImages($id: ID!, $imageIds: [ID!]!) {
-        productDeleteImages(id: $id, imageIds: $imageIds) {
-          deletedImageIds
-          product {
-            id
-          }
-          userErrors {
-            field
-            message
-          }
+async function uploadAndReplaceImage(admin, productId, oldMediaId, optimizedBuffer, filename, mimeType, altText) {
+  // 1. Ask Shopify for a staged upload target (a signed URL to POST the file to).
+  const stagedResp = await admin.graphql(
+    `#graphql
+      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets { url resourceUrl parameters { name value } }
+          userErrors { field message }
         }
       }
-    `;
-
-    await admin.graphql(deleteMutation, {
+    `,
+    {
       variables: {
-        id: productId,
-        imageIds: [imageId]
-      }
-    });
-  } catch (error) {
-    console.error('Error deleting image:', error);
-  }
-}
-
-/**
- * Upload optimized image to Shopify and replace original
- */
-async function uploadAndReplaceImage(admin, session, productId, originalImage, optimizedBuffer, altText) {
-  try {
-    const shop = session.shop;
-    const accessToken = session.accessToken;
-    const productIdNumeric = productId.split('/').pop();
-    
-    // Convert buffer to base64
-    const base64Image = optimizedBuffer.toString('base64');
-    
-    // Determine file extension based on buffer
-    const isWebP = optimizedBuffer[8] === 0x57 && optimizedBuffer[9] === 0x45;
-    const filename = `optimized-${Date.now()}.${isWebP ? 'webp' : 'jpg'}`;
-    
-    // Use REST API to create the new image with proper binary upload
-    const restUrl = `https://${shop}/admin/api/2024-01/products/${productIdNumeric}/images.json`;
-    
-    const imageData = {
-      image: {
-        attachment: base64Image,
-        alt: altText,
-        position: originalImage.position || 1
-      }
-    };
-
-    const uploadResponse = await fetch(restUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': accessToken
+        input: [{ filename, mimeType, resource: 'IMAGE', httpMethod: 'POST' }],
       },
-      body: JSON.stringify(imageData)
-    });
-
-    if (!uploadResponse.ok) {
-      const errorText = await uploadResponse.text();
-      console.error('Failed to upload image:', errorText);
-      throw new Error('Failed to upload optimized image');
     }
-
-    const uploadData = await uploadResponse.json();
-    const newImageId = uploadData.image.id;
-
-    // Delete the old image
-    const originalImageIdNumeric = originalImage.id.split('/').pop();
-    const deleteUrl = `https://${shop}/admin/api/2024-01/products/${productIdNumeric}/images/${originalImageIdNumeric}.json`;
-    
-    await fetch(deleteUrl, {
-      method: 'DELETE',
-      headers: {
-        'X-Shopify-Access-Token': accessToken
-      }
-    });
-
-    return `gid://shopify/ProductImage/${newImageId}`;
-
-  } catch (error) {
-    console.error('Error uploading and replacing image:', error);
-    throw error;
+  );
+  const stagedJson = await stagedResp.json();
+  const stagedErrors = stagedJson.data?.stagedUploadsCreate?.userErrors || [];
+  const target = stagedJson.data?.stagedUploadsCreate?.stagedTargets?.[0];
+  if (stagedErrors.length || !target) {
+    throw new Error('stagedUploadsCreate failed: ' + JSON.stringify(stagedErrors));
   }
+
+  // 2. POST the optimized bytes to the staged target. Order matters: all the
+  //    provided parameters first, then the file last.
+  const form = new FormData();
+  for (const param of target.parameters) {
+    form.append(param.name, param.value);
+  }
+  form.append('file', new Blob([optimizedBuffer], { type: mimeType }), filename);
+
+  const uploadResp = await fetch(target.url, { method: 'POST', body: form });
+  if (!uploadResp.ok) {
+    const text = await uploadResp.text();
+    console.error('Staged upload failed:', uploadResp.status, text.slice(0, 300));
+    throw new Error('Staged upload failed with status ' + uploadResp.status);
+  }
+
+  // 3. Attach the uploaded file to the product as new media.
+  const createResp = await admin.graphql(
+    `#graphql
+      mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+        productCreateMedia(productId: $productId, media: $media) {
+          media { id ... on MediaImage { id } }
+          mediaUserErrors { field message }
+        }
+      }
+    `,
+    {
+      variables: {
+        productId,
+        media: [{ alt: altText, mediaContentType: 'IMAGE', originalSource: target.resourceUrl }],
+      },
+    }
+  );
+  const createJson = await createResp.json();
+  const createErrors = createJson.data?.productCreateMedia?.mediaUserErrors || [];
+  if (createErrors.length) {
+    throw new Error('productCreateMedia failed: ' + JSON.stringify(createErrors));
+  }
+  const newMediaId = createJson.data?.productCreateMedia?.media?.[0]?.id;
+
+  // 4. Delete the original image now that the optimized copy is attached.
+  if (oldMediaId) {
+    const deleteResp = await admin.graphql(
+      `#graphql
+        mutation productDeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
+          productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+            deletedMediaIds
+            mediaUserErrors { field message }
+          }
+        }
+      `,
+      { variables: { productId, mediaIds: [oldMediaId] } }
+    );
+    const deleteJson = await deleteResp.json();
+    const deleteErrors = deleteJson.data?.productDeleteMedia?.mediaUserErrors || [];
+    if (deleteErrors.length) {
+      // Non-fatal: the optimized image is already attached; just log.
+      console.error('productDeleteMedia failed:', JSON.stringify(deleteErrors));
+    }
+  }
+
+  return newMediaId;
 }
 
 export async function action({ request }) {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
   const actionType = formData.get('actionType');
 
@@ -433,21 +449,25 @@ export async function action({ request }) {
     const productId = formData.get('productId');
     
     try {
-      // Fetch product details
+      // Fetch product media (MediaImage nodes give us the ids the current
+      // GraphQL create/delete mutations require).
       const response = await admin.graphql(
         `#graphql
-          query GetProductImages($id: ID!) {
+          query GetProductMedia($id: ID!) {
             product(id: $id) {
               id
               title
-              images(first: 250) {
+              media(first: 250) {
                 edges {
                   node {
-                    id
-                    url
-                    altText
-                    width
-                    height
+                    mediaContentType
+                    ... on MediaImage {
+                      id
+                      alt
+                      image {
+                        url
+                      }
+                    }
                   }
                 }
               }
@@ -459,22 +479,21 @@ export async function action({ request }) {
 
       const data = await response.json();
       const product = data.data.product;
-      const images = product.images.edges.map((edge, index) => ({
-        ...edge.node,
-        position: index + 1
-      }));
+      const images = product.media.edges
+        .map(edge => edge.node)
+        .filter(node => node && node.mediaContentType === 'IMAGE' && node.image && node.image.url)
+        .map(node => ({ id: node.id, url: node.image.url, altText: node.alt || '' }));
 
       const optimizationResults = [];
 
       for (const image of images) {
         try {
           const format = getImageFormat(image.url);
-          
-          // Get actual original image size
-          const originalSizeMB = await getActualImageSize(image.url);
 
-          // Optimize image with Sharp
+          // Optimize image with Sharp. This downloads the original once and
+          // returns its size, so we don't fetch the image a second time.
           const optimizationData = await optimizeImage(image.url, format);
+          const originalSizeMB = optimizationData.originalSizeMB;
 
           // Generate AI alt text if missing
           let altText = image.altText;
@@ -482,13 +501,20 @@ export async function action({ request }) {
             altText = await generateAIAltText(image.url, product.title);
           }
 
-          // Upload optimized image and replace the original
+          // Determine output format (optimizeImage outputs WebP for webp/png
+          // sources, otherwise JPEG) so we name/type the upload correctly.
+          const outIsWebp = format === 'webp' || format === 'png';
+          const outMime = outIsWebp ? 'image/webp' : 'image/jpeg';
+          const outFilename = `optimized-${Date.now()}.${outIsWebp ? 'webp' : 'jpg'}`;
+
+          // Upload optimized image (GraphQL) and replace the original
           const newImageId = await uploadAndReplaceImage(
             admin,
-            session,
             productId,
-            image,
+            image.id,
             optimizationData.optimizedBuffer,
+            outFilename,
+            outMime,
             altText
           );
 
