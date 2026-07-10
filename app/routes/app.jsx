@@ -42,9 +42,10 @@ export const loader = async ({ request }) => {
       try {
         const resp = await admin.graphql(
           `#graphql
-            query AppHandle { currentAppInstallation { app { handle } } }`
+            query AppHandle { currentAppInstallation { app { id title handle } } }`
         );
         const body = await resp.json();
+        console.log("[billing][debug] currentAppInstallation =", JSON.stringify(body?.data));
         appHandle = body?.data?.currentAppInstallation?.app?.handle;
       } catch (err) {
         console.error("[billing] failed to resolve app handle:", err);
@@ -52,11 +53,10 @@ export const loader = async ({ request }) => {
 
       if (appHandle) {
         const storeHandle = session.shop.replace(".myshopify.com", "");
+        const pricingUrl = `https://admin.shopify.com/store/${storeHandle}/charges/${appHandle}/pricing_plans`;
+        console.log("[billing][debug] redirecting to:", pricingUrl);
         // target: "_top" breaks out of the embedded iframe to Shopify admin.
-        throw redirect(
-          `https://admin.shopify.com/store/${storeHandle}/charges/${appHandle}/pricing_plans`,
-          { target: "_top" }
-        );
+        throw redirect(pricingUrl, { target: "_top" });
       }
       // If we couldn't resolve the handle, fail OPEN rather than lock the
       // merchant out of the app. Billing is re-checked on the next load.
