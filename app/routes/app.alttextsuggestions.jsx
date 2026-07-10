@@ -431,7 +431,19 @@ export default function AltTextSuggestions() {
   const [isVerifying, setIsVerifying] = useState(false);
 
   const isSubmitting = navigation.state === 'submitting';
-  const isGenerating = navigation.state === 'submitting' && navigation.formData?.get('actionType') === 'generateSuggestions';
+  const inFlightAction = navigation.formData?.get('actionType');
+  const inFlightFocusId = navigation.formData?.get('focusId');
+  // Bulk generate = a generateSuggestions submit that is NOT focused on a single image.
+  const isGenerating =
+    navigation.state === 'submitting' &&
+    inFlightAction === 'generateSuggestions' &&
+    !inFlightFocusId;
+  // The single image (if any) currently generating / applying, so only that
+  // row's button shows a spinner instead of every button on the page.
+  const generatingImageId =
+    inFlightAction === 'generateSuggestions' && inFlightFocusId ? inFlightFocusId : null;
+  const applyingImageId =
+    inFlightAction === 'applyAltText' ? navigation.formData?.get('imageId') : null;
 
   const handleVerifyApiKey = useCallback(() => {
     setError(null);
@@ -483,6 +495,19 @@ export default function AltTextSuggestions() {
     }))));
     submit(formData, { method: 'post' });
   }, [images, aiProvider, submit]);
+
+  // Generate a suggestion for a single image only (not all of them).
+  const handleGenerateOne = useCallback((image) => {
+    setError(null);
+    const formData = new FormData();
+    formData.append('actionType', 'generateSuggestions');
+    formData.append('aiProvider', aiProvider);
+    formData.append('focusId', image.id); // marks this as a single-image run
+    formData.append('images', JSON.stringify([
+      { id: image.id, url: image.url, productTitle: image.productTitle }
+    ]));
+    submit(formData, { method: 'post' });
+  }, [aiProvider, submit]);
 
   const handleSelectImage = useCallback((id) => {
     setSelectedImages(prev => prev.includes(id) ? prev.filter(imgId => imgId !== id) : [...prev, id]);
@@ -684,15 +709,26 @@ export default function AltTextSuggestions() {
                               />
                             </BlockStack>
 
-                            {image.status === 'pending' && image.suggestedAlt && (
-                              <Button
-                                variant="primary"
-                                onClick={() => handleApply(image.id)}
-                                loading={isSubmitting && !isGenerating}
-                                disabled={isSubmitting}
-                              >
-                                Apply This Alt Text
-                              </Button>
+                            {image.status === 'pending' && (
+                              <InlineStack gap="300">
+                                <Button
+                                  onClick={() => handleGenerateOne(image)}
+                                  loading={generatingImageId === image.id}
+                                  disabled={isSubmitting}
+                                >
+                                  {image.suggestedAlt ? 'Regenerate' : 'Generate for This Image'}
+                                </Button>
+                                {image.suggestedAlt && (
+                                  <Button
+                                    variant="primary"
+                                    onClick={() => handleApply(image.id)}
+                                    loading={applyingImageId === image.id}
+                                    disabled={isSubmitting}
+                                  >
+                                    Apply This Alt Text
+                                  </Button>
+                                )}
+                              </InlineStack>
                             )}
                           </BlockStack>
                         </Box>
