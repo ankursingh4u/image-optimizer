@@ -49,8 +49,25 @@ export const loader = async ({ request }) => {
     // Just CHECK for an active subscription — do NOT redirect here. If there is
     // none, we render our own in-app pricing page (below); the merchant is only
     // sent to Shopify's approval page when they click "Start free trial".
-    const { hasActivePayment } = await billing.check({ isTest });
-    needsSubscription = !hasActivePayment;
+    const check = await billing.check({ isTest });
+    needsSubscription = !check.hasActivePayment;
+    console.log(
+      "[billing][debug] shop=%s gated=%s isTest=%s hasActivePayment=%s subs=%s",
+      session.shop,
+      shopIsGated,
+      isTest,
+      check.hasActivePayment,
+      JSON.stringify(
+        (check.appSubscriptions || []).map((s) => ({
+          id: s.id,
+          name: s.name,
+          status: s.status,
+          test: s.test,
+        }))
+      )
+    );
+  } else {
+    console.log("[billing][debug] shop=%s NOT gated (testShops=%j)", session.shop, testShops);
   }
   // ------------------------------------------------------------------------
 
