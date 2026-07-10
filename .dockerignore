@@ -1,0 +1,11 @@
+.cache
+build
+node_modules
+
+# Never bake secrets or local state into the image
+.env
+.env.*
+.git
+.shopify
+prisma/dev.sqlite
+prisma/dev.sqlite-journal

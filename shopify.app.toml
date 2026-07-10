@@ -1,0 +1,40 @@
+name = "Image Optimizer"
+client_id = "ce955f2bc726c8b5f183dd0c559bcdbe"
+application_url = "https://imageoptimizer.onkra.online/"
+embedded = true
+
+
+[access_scopes]
+scopes = "write_products,write_files"
+
+[access.admin]
+direct_api_mode = "online"
+
+[auth]
+redirect_urls = [
+  "https://imageoptimizer.onkra.online/auth/callback",
+  "https://imageoptimizer.onkra.online/auth/shopify/callback",
+  "https://imageoptimizer.onkra.online/api/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-04"
+
+[[webhooks.subscriptions]]
+topics = [ "app/uninstalled" ]
+compliance_topics = [ "customers/redact", "customers/data_request", "shop/redact" ]
+uri = "https://hkdk.events/wosrrl2b1hj10n"
+
+[app_proxy]
+url =  "https://imageoptimizer.onkra.online/api/proxy"
+subpath = "store-pickup"
+prefix = "apps"
+
+[pos]
+embedded = false
+
+[app_preferences]
+url = "https://imageoptimizer.onkra.online/preferences"
+
+[build]
+automatically_update_urls_on_dev = false
