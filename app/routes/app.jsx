@@ -44,7 +44,9 @@ export const loader = async ({ request }) => {
         billing.request({
           plan: BASIC_PLAN,
           isTest,
-          returnUrl: `${env.SHOPIFY_APP_URL}/app`,
+          // Include shop so the top-level return after approval re-enters the
+          // embedded app instead of falling back to the shop-domain login page.
+          returnUrl: `${env.SHOPIFY_APP_URL}/app?shop=${session.shop}`,
         }),
     });
   }
