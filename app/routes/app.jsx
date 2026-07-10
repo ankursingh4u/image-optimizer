@@ -41,12 +41,12 @@ export const loader = async ({ request }) => {
       plans: [BASIC_PLAN],
       isTest,
       onFailure: async () =>
+        // No returnUrl: the library defaults to the correct embedded admin URL
+        // for embedded apps, so after approval the merchant re-enters the app
+        // inside Shopify admin (not the standalone shop-domain login page).
         billing.request({
           plan: BASIC_PLAN,
           isTest,
-          // Include shop so the top-level return after approval re-enters the
-          // embedded app instead of falling back to the shop-domain login page.
-          returnUrl: `${env.SHOPIFY_APP_URL}/app?shop=${session.shop}`,
         }),
     });
   }
