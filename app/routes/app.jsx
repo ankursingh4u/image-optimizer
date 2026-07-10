@@ -2,7 +2,7 @@ import { Outlet, useLoaderData, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
 import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
-import { authenticate } from "../shopify.server";
+import { authenticate, BASIC_PLAN } from "../shopify.server";
 
 // Import Polaris styles - THIS IS CRITICAL
 import "@shopify/polaris/build/esm/styles.css";
@@ -11,9 +11,9 @@ import "@shopify/polaris/build/esm/styles.css";
 import enTranslations from "@shopify/polaris/locales/en.json";
 
 export const loader = async ({ request }) => {
-  const { billing, session, admin, redirect } = await authenticate.admin(request);
+  const { billing, session } = await authenticate.admin(request);
 
-  // --- Billing gate (managed pricing) -------------------------------------
+  // --- Billing gate (code-managed billing) --------------------------------
   // Controlled entirely by env vars so we can test billing safely before
   // charging real merchants. Defaults are deliberately non-disruptive:
   //   BILLING_ENFORCED   "true" -> require a subscription for EVERY shop.
@@ -34,33 +34,19 @@ export const loader = async ({ request }) => {
   const shopIsGated = enforceAll || testShops.includes(session.shop);
 
   if (shopIsGated) {
-    const { hasActivePayment } = await billing.check({ isTest });
-
-    if (!hasActivePayment) {
-      // Look up this app's handle to build the managed-pricing page URL.
-      let appHandle;
-      try {
-        const resp = await admin.graphql(
-          `#graphql
-            query AppHandle { currentAppInstallation { app { id title handle } } }`
-        );
-        const body = await resp.json();
-        console.log("[billing][debug] currentAppInstallation =", JSON.stringify(body?.data));
-        appHandle = body?.data?.currentAppInstallation?.app?.handle;
-      } catch (err) {
-        console.error("[billing] failed to resolve app handle:", err);
-      }
-
-      if (appHandle) {
-        const storeHandle = session.shop.replace(".myshopify.com", "");
-        const pricingUrl = `https://admin.shopify.com/store/${storeHandle}/charges/${appHandle}/pricing_plans`;
-        console.log("[billing][debug] redirecting to:", pricingUrl);
-        // target: "_top" breaks out of the embedded iframe to Shopify admin.
-        throw redirect(pricingUrl, { target: "_top" });
-      }
-      // If we couldn't resolve the handle, fail OPEN rather than lock the
-      // merchant out of the app. Billing is re-checked on the next load.
-    }
+    // Require an active Basic subscription. If the shop has none, `require`
+    // calls `onFailure`, which redirects the merchant to Shopify's billing
+    // confirmation page (a TEST charge when isTest=true — no real money).
+    await billing.require({
+      plans: [BASIC_PLAN],
+      isTest,
+      onFailure: async () =>
+        billing.request({
+          plan: BASIC_PLAN,
+          isTest,
+          returnUrl: `${env.SHOPIFY_APP_URL}/app`,
+        }),
+    });
   }
   // ------------------------------------------------------------------------
 
