@@ -54,6 +54,8 @@ async function fetchAllProducts(admin, cursor = null) {
                     alt
                     image {
                       url
+                      width
+                      height
                     }
                   }
                 }
@@ -99,7 +101,13 @@ async function getAllProducts(admin) {
         .filter(n => n && n.mediaContentType === 'IMAGE' && n.image && n.image.url);
       p.images = {
         edges: mediaNodes.map(n => ({
-          node: { id: n.id, url: n.image.url, altText: n.alt || '' },
+          node: {
+            id: n.id,
+            url: n.image.url,
+            altText: n.alt || '',
+            width: n.image.width,
+            height: n.image.height,
+          },
         })),
       };
       delete p.media;
@@ -146,6 +154,21 @@ function getImageFormat(url) {
   if (urlLower.includes('.png')) return 'png';
   if (urlLower.includes('.gif')) return 'gif';
   return 'jpg';
+}
+
+/**
+ * Estimate an image's file size (MB) from its pixel dimensions and format.
+ * Instant and requires no network request — used for images that haven't been
+ * optimized yet so the UI shows a real number instead of 0.
+ */
+function estimateImageSize(width, height, format = 'jpg') {
+  if (!width || !height) return 0;
+  const pixels = width * height;
+  const bytesPerPixel = 3;
+  const uncompressedBytes = pixels * bytesPerPixel;
+  const compressionRatios = { jpg: 0.1, jpeg: 0.1, png: 0.3, webp: 0.05, gif: 0.2 };
+  const ratio = compressionRatios[String(format).toLowerCase()] || 0.15;
+  return (uncompressedBytes * ratio) / (1024 * 1024);
 }
 
 /**
@@ -199,11 +222,11 @@ export async function loader({ request }) {
         let totalOriginalSize = 0;
         let totalOptimizedSize = 0;
 
-        // Use sizes already measured during optimization (stored in metafields).
-        // We intentionally do NOT download image files here: the previous version
-        // fetched every un-optimized image from the CDN on every page load, which
-        // made this screen extremely slow (hundreds of network requests per view).
-        // Real sizes are recorded when a product is optimized via the action below.
+        // For optimized images, use the real sizes stored during optimization.
+        // For not-yet-optimized images, ESTIMATE the size from the dimensions
+        // (instant, no network) so the UI shows a real number instead of 0.
+        // We deliberately do NOT download images here — doing that on every page
+        // load is what made this screen extremely slow.
         for (const image of images) {
           const imageKey = `image_${image.id.split('/').pop()}`;
           const metafield = product.metafields.edges.find(
@@ -218,6 +241,16 @@ export async function loader({ request }) {
             } catch (e) {
               console.error('Error parsing metafield:', e);
             }
+          } else {
+            // Estimated size. Added to BOTH totals so the image shows a size but
+            // contributes 0 to "saved" until it is actually optimized.
+            const est = estimateImageSize(
+              image.width,
+              image.height,
+              getImageFormat(image.url)
+            );
+            totalOriginalSize += est;
+            totalOptimizedSize += est;
           }
         }
 
