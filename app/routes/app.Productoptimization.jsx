@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useLoaderData, useSubmit, useNavigation, useActionData } from 'react-router';
 import { authenticate } from '../shopify.server';
 import {
@@ -221,6 +221,7 @@ export async function loader({ request }) {
 
         let totalOriginalSize = 0;
         let totalOptimizedSize = 0;
+        let unoptimizedEstimate = 0;
 
         // For optimized images, use the real sizes stored during optimization.
         // For not-yet-optimized images, ESTIMATE the size from the dimensions
@@ -251,6 +252,7 @@ export async function loader({ request }) {
             );
             totalOriginalSize += est;
             totalOptimizedSize += est;
+            unoptimizedEstimate += est;
           }
         }
 
@@ -264,7 +266,10 @@ export async function loader({ request }) {
           totalOriginalSizeMB: totalOriginalSize,
           totalOptimizedSizeMB: totalOptimizedSize,
           sizeSavedMB: totalOriginalSize - totalOptimizedSize,
-          compressionRate: totalOriginalSize > 0 
+          // Estimated additional savings if the not-yet-optimized images are
+          // optimized (~68% typical reduction with WebP + compression).
+          potentialSavingsMB: unoptimizedEstimate * 0.68,
+          compressionRate: totalOriginalSize > 0
             ? Math.round(((totalOriginalSize - totalOptimizedSize) / totalOriginalSize) * 100)
             : 0,
           featuredImageUrl: product.featuredImage?.url || images[0]?.url,
@@ -272,29 +277,13 @@ export async function loader({ request }) {
         };
     });
 
-    // Apply filters
-    let filteredProducts = processedProducts;
-    if (filter === 'needs_optimization') {
-      filteredProducts = processedProducts.filter(p => p.needsOptimization);
-    } else if (filter === 'optimized') {
-      filteredProducts = processedProducts.filter(p => !p.needsOptimization);
-    } else if (filter === 'no_alt_text') {
-      filteredProducts = processedProducts.filter(p => p.imagesWithAlt === 0);
-    }
-
-    // Apply sorting
-    if (sortBy === 'score_asc') {
-      filteredProducts.sort((a, b) => a.score - b.score);
-    } else if (sortBy === 'score_desc') {
-      filteredProducts.sort((a, b) => b.score - a.score);
-    } else if (sortBy === 'size_desc') {
-      filteredProducts.sort((a, b) => b.totalOriginalSizeMB - a.totalOriginalSizeMB);
-    } else if (sortBy === 'images_desc') {
-      filteredProducts.sort((a, b) => b.imageCount - a.imageCount);
-    }
+    // Return the FULL list. Filtering and sorting now happen client-side for
+    // instant response (no server round-trip when the merchant changes them).
+    // Default order: lowest optimization score first.
+    processedProducts.sort((a, b) => a.score - b.score);
 
     return {
-      products: filteredProducts,
+      products: processedProducts,
       filter,
       sortBy,
       stats: {
@@ -792,27 +781,47 @@ export default function ProductOptimization() {
 
   const isSubmitting = navigation.state === 'submitting';
 
+  // Keep local products in sync when the loader revalidates (e.g. after an
+  // optimization reload).
+  useEffect(() => {
+    setProducts(initialProducts);
+  }, [initialProducts]);
+
+  // Filtering and sorting are done here, client-side, so they are instant.
+  const visibleProducts = useMemo(() => {
+    let list = products;
+    if (filter === 'needs_optimization') list = list.filter(p => p.needsOptimization);
+    else if (filter === 'optimized') list = list.filter(p => !p.needsOptimization);
+    else if (filter === 'no_alt_text') list = list.filter(p => p.imagesWithAlt === 0);
+
+    const sorted = [...list];
+    if (sortBy === 'score_asc') sorted.sort((a, b) => a.score - b.score);
+    else if (sortBy === 'score_desc') sorted.sort((a, b) => b.score - a.score);
+    else if (sortBy === 'size_desc') sorted.sort((a, b) => b.totalOriginalSizeMB - a.totalOriginalSizeMB);
+    else if (sortBy === 'images_desc') sorted.sort((a, b) => b.imageCount - a.imageCount);
+    return sorted;
+  }, [products, filter, sortBy]);
+
   useEffect(() => {
     if (actionData?.success) {
       setSuccessMessage(actionData.message);
       setTimeout(() => setSuccessMessage(null), 5000);
-      
-      // Reload products to show updated data
-      submit({ filter, sortBy }, { method: 'get' });
+
+      // Reload full product data to reflect the optimization (client re-filters).
+      submit({}, { method: 'get' });
     } else if (actionData?.error) {
       setError(actionData.error);
     }
-  }, [actionData, filter, sortBy, submit]);
+  }, [actionData, submit]);
 
+  // Filter/sort are client-side now — just update local state (no server reload).
   const handleFilterChange = useCallback((value) => {
     setFilter(value);
-    submit({ filter: value, sortBy }, { method: 'get' });
-  }, [sortBy, submit]);
+  }, []);
 
   const handleSortChange = useCallback((value) => {
     setSortBy(value);
-    submit({ filter, sortBy: value }, { method: 'get' });
-  }, [filter, submit]);
+  }, []);
 
   const handleSelectProduct = useCallback((id) => {
     setSelectedProducts(prev => 
@@ -822,9 +831,9 @@ export default function ProductOptimization() {
 
   const handleSelectAll = useCallback(() => {
     setSelectedProducts(
-      selectedProducts.length === products.length ? [] : products.map(p => p.id)
+      selectedProducts.length === visibleProducts.length ? [] : visibleProducts.map(p => p.id)
     );
-  }, [selectedProducts.length, products]);
+  }, [selectedProducts.length, visibleProducts]);
 
   const handleOptimizeProduct = useCallback((productId) => {
     const formData = new FormData();
@@ -963,8 +972,8 @@ export default function ProductOptimization() {
               <Divider />
 
               <Checkbox
-                label={`Select All (${products.length} products)`}
-                checked={selectedProducts.length === products.length && products.length > 0}
+                label={`Select All (${visibleProducts.length} products)`}
+                checked={selectedProducts.length === visibleProducts.length && visibleProducts.length > 0}
                 onChange={handleSelectAll}
               />
             </BlockStack>
@@ -974,7 +983,7 @@ export default function ProductOptimization() {
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
-              {products.length === 0 ? (
+              {visibleProducts.length === 0 ? (
                 <EmptyState
                   heading="No products found"
                   image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
@@ -982,7 +991,7 @@ export default function ProductOptimization() {
                   <p>Try adjusting your filters to see products.</p>
                 </EmptyState>
               ) : (
-                products.map((product) => (
+                visibleProducts.map((product) => (
                   <Card key={product.id} background={selectedProducts.includes(product.id) ? 'bg-surface-selected' : undefined}>
                     <InlineStack gap="400" blockAlign="start">
                       <Checkbox
@@ -1005,7 +1014,9 @@ export default function ProductOptimization() {
                               <Text variant="headingMd" as="h3">{product.title}</Text>
                               <InlineStack gap="200">
                                 <Badge>{product.status}</Badge>
-                                <Badge tone="info">{product.imageCount} images</Badge>
+                                <Badge tone={product.imageCount > 0 && product.optimizedImages === product.imageCount ? "success" : "info"}>
+                                  {product.optimizedImages}/{product.imageCount} images optimized
+                                </Badge>
                               </InlineStack>
                             </BlockStack>
                             {getScoreBadge(product.score)}
@@ -1036,10 +1047,21 @@ export default function ProductOptimization() {
                             </BlockStack>
 
                             <BlockStack gap="200">
-                              <Text variant="bodySm" as="p" tone="subdued">Size Saved</Text>
-                              <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
-                                {formatBytes(product.sizeSavedMB)} ({product.compressionRate}%)
-                              </Text>
+                              {product.sizeSavedMB > 0 ? (
+                                <>
+                                  <Text variant="bodySm" as="p" tone="subdued">Size Saved</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
+                                    {formatBytes(product.sizeSavedMB)} ({product.compressionRate}%)
+                                  </Text>
+                                </>
+                              ) : (
+                                <>
+                                  <Text variant="bodySm" as="p" tone="subdued">Potential Savings</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold">
+                                    ~{formatBytes(product.potentialSavingsMB)}
+                                  </Text>
+                                </>
+                              )}
                             </BlockStack>
                           </InlineStack>
 
