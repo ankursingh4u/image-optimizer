@@ -11,7 +11,7 @@ import { authenticate, BASIC_PLAN } from "../shopify.server";
  * the library's helper used the stored offline token, which was returning 401.
  */
 export const action = async ({ request }) => {
-  const { admin, session, redirect } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   // eslint-disable-next-line no-undef
   const env = process.env;
   const isTest = env.BILLING_TEST_MODE !== "false";
@@ -82,16 +82,16 @@ export const action = async ({ request }) => {
   const confirmationUrl = result?.confirmationUrl;
 
   if (userErrors.length || !confirmationUrl) {
-    // Surface the real reason instead of a blank 401.
-    throw new Response(
-      "Could not start subscription: " +
+    return {
+      error:
+        "Could not start subscription: " +
         (userErrors.map((e) => e.message).join("; ") || "no confirmation URL returned"),
-      { status: 500 }
-    );
+    };
   }
 
-  // Top-level redirect (out of the iframe) to Shopify's approval page.
-  throw redirect(confirmationUrl, { target: "_top" });
+  // Return the approval URL to the client; App Bridge performs the top-level
+  // redirect out of the iframe (a server redirect to this shop-admin URL 401s).
+  return { confirmationUrl };
 };
 
 export default function Subscribe() {

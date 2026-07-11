@@ -1,4 +1,5 @@
-import { Outlet, useLoaderData, useRouteError, Form, useNavigation } from "react-router";
+import { useEffect } from "react";
+import { Outlet, useLoaderData, useRouteError, useFetcher } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
 import {
@@ -12,6 +13,7 @@ import {
   Text,
   Badge,
   Divider,
+  Banner,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 
@@ -88,8 +90,23 @@ const PLAN_FEATURES = [
 ];
 
 function PricingScreen() {
-  const navigation = useNavigation();
-  const subscribing = navigation.state !== "idle";
+  const fetcher = useFetcher();
+  const confirmationUrl = fetcher.data?.confirmationUrl;
+  const error = fetcher.data?.error;
+  // Keep the button busy once we have a URL too (we're about to redirect away).
+  const subscribing = fetcher.state !== "idle" || Boolean(confirmationUrl);
+
+  useEffect(() => {
+    if (!confirmationUrl) return;
+    // App Bridge intercepts a top-targeted anchor and redirects the TOP frame
+    // (out of the embedded iframe) to Shopify's approval page.
+    const a = document.createElement("a");
+    a.href = confirmationUrl;
+    a.target = "_top";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, [confirmationUrl]);
 
   return (
     <Page title="Choose your plan">
@@ -125,11 +142,19 @@ function PricingScreen() {
 
               <Divider />
 
-              <Form method="post" action="/app/subscribe">
-                <Button submit variant="primary" size="large" loading={subscribing} disabled={subscribing}>
-                  Start 3-day free trial
-                </Button>
-              </Form>
+              {error ? <Banner tone="critical">{error}</Banner> : null}
+
+              <Button
+                variant="primary"
+                size="large"
+                loading={subscribing}
+                disabled={subscribing}
+                onClick={() =>
+                  fetcher.submit({}, { method: "post", action: "/app/subscribe" })
+                }
+              >
+                Start 3-day free trial
+              </Button>
               <Text variant="bodySm" as="p" tone="subdued">
                 You&apos;ll be taken to Shopify to approve the subscription.
               </Text>
