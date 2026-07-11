@@ -22,7 +22,7 @@ import "@shopify/polaris/build/esm/styles.css";
 import enTranslations from "@shopify/polaris/locales/en.json";
 
 export const loader = async ({ request }) => {
-  const { billing, session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
   // --- Billing gate (code-managed billing) --------------------------------
   // Controlled entirely by env vars so we can test billing safely before
@@ -46,28 +46,33 @@ export const loader = async ({ request }) => {
 
   let needsSubscription = false;
   if (shopIsGated) {
-    // Just CHECK for an active subscription — do NOT redirect here. If there is
-    // none, we render our own in-app pricing page (below); the merchant is only
-    // sent to Shopify's approval page when they click "Start free trial".
-    const check = await billing.check({ isTest });
-    needsSubscription = !check.hasActivePayment;
+    // Check active subscriptions via the admin GraphQL client (same auth path as
+    // the subscribe action — avoids the offline-token 401 seen with billing.*).
+    // We do NOT redirect here; if there's no active subscription we render our
+    // own in-app pricing page and only send the merchant to Shopify on click.
+    const resp = await admin.graphql(
+      `#graphql
+        query ActiveSubs {
+          currentAppInstallation {
+            activeSubscriptions { id name status test }
+          }
+        }`
+    );
+    const subs =
+      (await resp.json())?.data?.currentAppInstallation?.activeSubscriptions || [];
+    // In test mode only test subscriptions count; in live mode only live ones.
+    const active = subs.filter(
+      (s) => s.status === "ACTIVE" && Boolean(s.test) === isTest
+    );
+    needsSubscription = active.length === 0;
     console.log(
-      "[billing][debug] shop=%s gated=%s isTest=%s hasActivePayment=%s subs=%s",
+      "[billing][debug] shop=%s isTest=%s subs=%s",
       session.shop,
-      shopIsGated,
       isTest,
-      check.hasActivePayment,
-      JSON.stringify(
-        (check.appSubscriptions || []).map((s) => ({
-          id: s.id,
-          name: s.name,
-          status: s.status,
-          test: s.test,
-        }))
-      )
+      JSON.stringify(subs)
     );
   } else {
-    console.log("[billing][debug] shop=%s NOT gated (testShops=%j)", session.shop, testShops);
+    console.log("[billing][debug] shop=%s NOT gated", session.shop);
   }
   // ------------------------------------------------------------------------
 
