@@ -341,7 +341,8 @@ export async function loader({ request }) {
         optimized: processedProducts.filter(p => !p.needsOptimization).length,
         totalImages: processedProducts.reduce((sum, p) => sum + p.imageCount, 0),
         totalSizeMB: processedProducts.reduce((sum, p) => sum + p.totalOriginalSizeMB, 0),
-        potentialSavingsMB: processedProducts.reduce((sum, p) => sum + p.sizeSavedMB, 0)
+        potentialSavingsMB: processedProducts.reduce((sum, p) => sum + p.sizeSavedMB, 0),
+        optimizedImagesCount: processedProducts.reduce((sum, p) => sum + (p.optimizedImages || 0), 0)
       },
       error: null
     };
@@ -357,7 +358,8 @@ export async function loader({ request }) {
         optimized: 0,
         totalImages: 0,
         totalSizeMB: 0,
-        potentialSavingsMB: 0
+        potentialSavingsMB: 0,
+        optimizedImagesCount: 0
       },
       error: 'Failed to load products'
     };
@@ -1106,8 +1108,19 @@ export default function ProductOptimization() {
             <Box width="25%">
               <Card>
                 <BlockStack gap="200">
-                  <Text variant="bodyMd" as="p" tone="subdued">Actual Savings</Text>
-                  <Text variant="heading2xl" as="h2" tone="success">{formatBytes(stats.potentialSavingsMB)}</Text>
+                  <Text variant="bodyMd" as="p" tone="subdued">Total Size Reduced</Text>
+                  {stats.potentialSavingsMB >= 0.01 ? (
+                    <Text variant="heading2xl" as="h2" tone="success">{formatBytes(stats.potentialSavingsMB)}</Text>
+                  ) : (
+                    <BlockStack gap="100">
+                      <Text variant="heading2xl" as="h2" tone="success">✓</Text>
+                      <Text variant="bodySm" as="p" tone="subdued">
+                        {stats.optimizedImagesCount > 0
+                          ? `${stats.optimizedImagesCount} images already optimized`
+                          : 'Optimize large images to see savings'}
+                      </Text>
+                    </BlockStack>
+                  )}
                 </BlockStack>
               </Card>
             </Box>
