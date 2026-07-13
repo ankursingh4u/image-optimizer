@@ -1035,9 +1035,9 @@ export default function ProductOptimization() {
   const formatBytes = (mb) => {
     const val = Number(mb) || 0;
     if (val >= 1000) return `${(val / 1000).toFixed(1)} GB`;
-    // Show KB for anything under 1 MB so small (but real) savings don't all
-    // collapse to a confusing "0.0 MB".
-    if (val > 0 && val < 1) return `${Math.max(1, Math.round(val * 1024))} KB`;
+    // Show KB for anything under 1 MB so small (but real) savings — and zero —
+    // never collapse to a confusing "0.0 MB".
+    if (val < 1) return `${Math.max(0, Math.round(val * 1024))} KB`;
     return `${val.toFixed(1)} MB`;
   };
 
