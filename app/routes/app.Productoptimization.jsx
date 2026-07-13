@@ -297,12 +297,11 @@ export async function loader({ request }) {
         const totalOptimizedSize = storedOptimized + estUnoptimized; // unoptimized save 0
         const sizeSaved = Math.max(storedOriginal - storedOptimized, 0);
 
-        // TEMP DIAGNOSTIC: log what is actually stored so we can see why savings
-        // read as 0. Remove after diagnosis.
-        if (optimizedCount > 0) {
-          const rawRecs = Object.entries(perImage).map(([k, v]) => `${k.slice(0, 14)}:o=${v.o.toFixed(3)},c=${v.c.toFixed(3)}`);
-          console.log(`[optdiag] "${product.title}" imgs=${imageCount} optCount=${optimizedCount} storedOrig=${storedOriginal.toFixed(3)} storedOpt=${storedOptimized.toFixed(3)} saved=${sizeSaved.toFixed(3)} hasSummary=${!!summary} recs=[${rawRecs.join(' | ')}]`);
-        }
+        // A product counts as "already optimized" when it has optimization
+        // records but there is essentially no further saving available (its images
+        // are already small/compressed). Used by the UI to show an honest state
+        // instead of a confusing "Size Saved 0.0 MB".
+        const alreadyOptimized = optimizedCount > 0 && sizeSaved < 0.01;
 
         return {
           id: product.id,
@@ -312,6 +311,7 @@ export async function loader({ request }) {
           imageCount,
           ...optimizationData,
           optimizedImages: optimizedCount,
+          alreadyOptimized,
           totalOriginalSizeMB: totalOriginalSize,
           totalOptimizedSizeMB: totalOptimizedSize,
           sizeSavedMB: sizeSaved,
@@ -587,18 +587,99 @@ export async function action({ request }) {
           // full saving instead of ~0.
           const prevRec = existingByKey[`image_${image.id.split('/').pop()}`];
           const measuredOriginalMB = optimizationData.originalSizeMB;
-          const originalSizeMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
+          const newOptimizedMB = optimizationData.optimizedSizeMB;
+          const trueOriginalMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
             ? Number(prevRec.originalSizeMB)
             : measuredOriginalMB;
-          const compressionRate = originalSizeMB > 0
-            ? Math.round(((originalSizeMB - optimizationData.optimizedSizeMB) / originalSizeMB) * 100)
-            : optimizationData.compressionRate;
 
           // Generate AI alt text if missing
           let altText = image.altText;
           if (!altText || altText.length < 10) {
             altText = await generateAIAltText(image.url, product.title);
           }
+
+          // Only replace the image if the re-encoded version is at least 2%
+          // SMALLER than what is on the store now. Many images are already
+          // optimized (small WebP/JPEG) and re-encoding them is larger — replacing
+          // in that case would INFLATE the file and delete the smaller original.
+          const beneficial = newOptimizedMB < measuredOriginalMB * 0.98;
+
+          if (!beneficial) {
+            // Already optimized: keep the current image. Update alt text only if we
+            // generated/changed it, and record the image honestly (0 further
+            // saving, but preserve any real historical saving from trueOriginal).
+            if (altText && altText !== image.altText) {
+              try {
+                await admin.graphql(
+                  `#graphql
+                    mutation UpdateAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
+                      productUpdateMedia(productId: $productId, media: $media) {
+                        media { id }
+                        mediaUserErrors { field message }
+                      }
+                    }
+                  `,
+                  { variables: { productId, media: [{ id: image.id, alt: altText }] } }
+                );
+              } catch (altErr) {
+                console.error('Alt update failed (non-fatal):', altErr.message);
+              }
+            }
+
+            const imageKey = `image_${image.id.split('/').pop()}`;
+            const compressionRate = trueOriginalMB > 0
+              ? Math.round(((trueOriginalMB - measuredOriginalMB) / trueOriginalMB) * 100)
+              : 0;
+            await admin.graphql(
+              `#graphql
+                mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
+                  metafieldsSet(metafields: $metafields) {
+                    metafields { key value }
+                    userErrors { field message }
+                  }
+                }
+              `,
+              {
+                variables: {
+                  metafields: [
+                    {
+                      ownerId: productId,
+                      namespace: 'image_optimization',
+                      key: imageKey,
+                      value: JSON.stringify({
+                        originalSizeMB: trueOriginalMB,
+                        optimizedSizeMB: measuredOriginalMB,
+                        compressionRate,
+                        format,
+                        altText,
+                        alreadyOptimized: true,
+                        optimizedAt: new Date().toISOString(),
+                        originalImageId: image.id,
+                        newImageId: image.id
+                      }),
+                      type: 'json'
+                    }
+                  ]
+                }
+              }
+            );
+
+            optimizationResults.push({
+              imageId: image.id,
+              originalImageId: image.id,
+              originalSize: trueOriginalMB,
+              optimizedSize: measuredOriginalMB,
+              compressionRate,
+              alreadyOptimized: true,
+              altText,
+              success: true
+            });
+            continue;
+          }
+
+          const compressionRate = trueOriginalMB > 0
+            ? Math.round(((trueOriginalMB - newOptimizedMB) / trueOriginalMB) * 100)
+            : optimizationData.compressionRate;
 
           // Determine output format (optimizeImage outputs WebP for webp/png
           // sources, otherwise JPEG) so we name/type the upload correctly.
@@ -642,8 +723,8 @@ export async function action({ request }) {
                     namespace: 'image_optimization',
                     key: imageKey,
                     value: JSON.stringify({
-                      originalSizeMB: originalSizeMB,
-                      optimizedSizeMB: optimizationData.optimizedSizeMB,
+                      originalSizeMB: trueOriginalMB,
+                      optimizedSizeMB: newOptimizedMB,
                       compressionRate: compressionRate,
                       format: format,
                       altText: altText,
@@ -661,8 +742,8 @@ export async function action({ request }) {
           optimizationResults.push({
             imageId: newImageId,
             originalImageId: image.id,
-            originalSize: originalSizeMB,
-            optimizedSize: optimizationData.optimizedSizeMB,
+            originalSize: trueOriginalMB,
+            optimizedSize: newOptimizedMB,
             compressionRate: compressionRate,
             altText,
             success: true
@@ -721,9 +802,22 @@ export async function action({ request }) {
         }
       );
 
+      const compressed = successfulOptimizations.filter(r => !r.alreadyOptimized);
+      const skipped = successfulOptimizations.filter(r => r.alreadyOptimized);
+      const totalSaved = compressed.reduce((sum, r) => sum + Math.max(r.originalSize - r.optimizedSize, 0), 0);
+
+      let message;
+      if (compressed.length > 0) {
+        message = `Compressed ${compressed.length} image${compressed.length > 1 ? 's' : ''} for "${product.title}" — saved ${totalSaved >= 1 ? totalSaved.toFixed(1) + ' MB' : Math.round(totalSaved * 1024) + ' KB'}.`;
+      } else if (skipped.length > 0) {
+        message = `"${product.title}" is already optimized — its ${skipped.length} image${skipped.length > 1 ? 's are' : ' is'} already as small as possible, so nothing was changed.`;
+      } else {
+        message = `No images could be processed for "${product.title}".`;
+      }
+
       return {
         success: true,
-        message: `Successfully optimized ${successfulOptimizations.length} out of ${images.length} images for "${product.title}"`,
+        message,
         results: optimizationResults
       };
 
@@ -1133,11 +1227,18 @@ export default function ProductOptimization() {
                             </BlockStack>
 
                             <BlockStack gap="200">
-                              {product.optimizedImages > 0 ? (
+                              {product.sizeSavedMB >= 0.01 ? (
                                 <>
                                   <Text variant="bodySm" as="p" tone="subdued">Size Saved</Text>
                                   <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
                                     {formatBytes(product.sizeSavedMB)} ({product.compressionRate}%)
+                                  </Text>
+                                </>
+                              ) : product.alreadyOptimized ? (
+                                <>
+                                  <Text variant="bodySm" as="p" tone="subdued">Status</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
+                                    ✓ Already optimized
                                   </Text>
                                 </>
                               ) : (
@@ -1169,7 +1270,7 @@ export default function ProductOptimization() {
                               loading={optimizingId === product.id}
                               disabled={isSubmitting}
                             >
-                              {product.optimizedImages > 0 ? 'Re-optimize This Product' : 'Optimize This Product'}
+                              {product.alreadyOptimized ? 'Re-check Images' : product.optimizedImages > 0 ? 'Re-optimize This Product' : 'Optimize This Product'}
                             </Button>
                           </InlineStack>
                         </BlockStack>
