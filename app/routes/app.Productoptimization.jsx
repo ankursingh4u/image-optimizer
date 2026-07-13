@@ -297,6 +297,13 @@ export async function loader({ request }) {
         const totalOptimizedSize = storedOptimized + estUnoptimized; // unoptimized save 0
         const sizeSaved = Math.max(storedOriginal - storedOptimized, 0);
 
+        // TEMP DIAGNOSTIC: log what is actually stored so we can see why savings
+        // read as 0. Remove after diagnosis.
+        if (optimizedCount > 0) {
+          const rawRecs = Object.entries(perImage).map(([k, v]) => `${k.slice(0, 14)}:o=${v.o.toFixed(3)},c=${v.c.toFixed(3)}`);
+          console.log(`[optdiag] "${product.title}" imgs=${imageCount} optCount=${optimizedCount} storedOrig=${storedOriginal.toFixed(3)} storedOpt=${storedOptimized.toFixed(3)} saved=${sizeSaved.toFixed(3)} hasSummary=${!!summary} recs=[${rawRecs.join(' | ')}]`);
+        }
+
         return {
           id: product.id,
           title: product.title,
