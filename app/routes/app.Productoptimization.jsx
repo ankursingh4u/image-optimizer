@@ -1229,7 +1229,7 @@ export default function ProductOptimization() {
                             <BlockStack gap="200">
                               {product.sizeSavedMB >= 0.01 ? (
                                 <>
-                                  <Text variant="bodySm" as="p" tone="subdued">Size Saved</Text>
+                                  <Text variant="bodySm" as="p" tone="subdued">Size Reduced</Text>
                                   <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
                                     {formatBytes(product.sizeSavedMB)} ({product.compressionRate}%)
                                   </Text>
