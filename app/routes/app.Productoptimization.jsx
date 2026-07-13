@@ -219,9 +219,24 @@ export async function loader({ request }) {
         const images = product.images.edges.map(edge => edge.node);
         const optimizationData = calculateOptimizationScore(product);
 
+        // Parse the per-image optimization records (key: image_<mediaId>) written
+        // during optimization. Keyed lookup is O(1) and robust to ordering.
+        const optRecords = {};
+        for (const mf of product.metafields.edges) {
+          if (mf.node.key.startsWith('image_')) {
+            try { optRecords[mf.node.key] = JSON.parse(mf.node.value); } catch (e) {}
+          }
+        }
+        // Authoritative product-level summary written at optimize time. Used as a
+        // fallback when the per-image ids no longer match the current media.
+        let summary = null;
+        const summaryMf = product.metafields.edges.find(mf => mf.node.key === 'optimization_summary');
+        if (summaryMf) { try { summary = JSON.parse(summaryMf.node.value); } catch (e) {} }
+
         let totalOriginalSize = 0;
         let totalOptimizedSize = 0;
         let unoptimizedEstimate = 0;
+        let matchedOptimized = 0;
 
         // For optimized images, use the real sizes stored during optimization.
         // For not-yet-optimized images, ESTIMATE the size from the dimensions
@@ -230,18 +245,12 @@ export async function loader({ request }) {
         // load is what made this screen extremely slow.
         for (const image of images) {
           const imageKey = `image_${image.id.split('/').pop()}`;
-          const metafield = product.metafields.edges.find(
-            mf => mf.node.key === imageKey
-          );
+          const rec = optRecords[imageKey];
 
-          if (metafield) {
-            try {
-              const optData = JSON.parse(metafield.node.value);
-              totalOriginalSize += optData.originalSizeMB || 0;
-              totalOptimizedSize += optData.optimizedSizeMB || 0;
-            } catch (e) {
-              console.error('Error parsing metafield:', e);
-            }
+          if (rec) {
+            totalOriginalSize += rec.originalSizeMB || 0;
+            totalOptimizedSize += rec.optimizedSizeMB || 0;
+            matchedOptimized++;
           } else {
             // Estimated size. Added to BOTH totals so the image shows a size but
             // contributes 0 to "saved" until it is actually optimized.
@@ -256,6 +265,26 @@ export async function loader({ request }) {
           }
         }
 
+        let optimizedImages = matchedOptimized;
+        let sizeSaved = totalOriginalSize - totalOptimizedSize;
+
+        // Fallback: the product was optimized (summary exists) but none of the
+        // per-image records match the CURRENT media ids — e.g. the images were
+        // re-uploaded/replaced so their ids changed. Trust the stored summary so
+        // real savings still show instead of collapsing to 0.
+        if (matchedOptimized === 0 && summary && (summary.optimizedImages || 0) > 0) {
+          optimizedImages = Math.min(summary.optimizedImages || 0, images.length);
+          const summarySaved = summary.totalSizeSavedMB != null
+            ? summary.totalSizeSavedMB
+            : ((summary.totalOriginalSizeMB || 0) - (summary.totalOptimizedSizeMB || 0));
+          totalOriginalSize = summary.totalOriginalSizeMB || totalOriginalSize;
+          totalOptimizedSize = summary.totalOptimizedSizeMB != null
+            ? summary.totalOptimizedSizeMB
+            : (totalOriginalSize - summarySaved);
+          sizeSaved = summarySaved;
+          unoptimizedEstimate = 0;
+        }
+
         return {
           id: product.id,
           title: product.title,
@@ -263,14 +292,17 @@ export async function loader({ request }) {
           status: product.status,
           imageCount: images.length,
           ...optimizationData,
+          // Use the size-based optimized count (matches what we can prove was
+          // optimized), falling back to the summary/score-based count.
+          optimizedImages,
           totalOriginalSizeMB: totalOriginalSize,
           totalOptimizedSizeMB: totalOptimizedSize,
-          sizeSavedMB: totalOriginalSize - totalOptimizedSize,
+          sizeSavedMB: sizeSaved,
           // Estimated additional savings if the not-yet-optimized images are
           // optimized (~68% typical reduction with WebP + compression).
           potentialSavingsMB: unoptimizedEstimate * 0.68,
           compressionRate: totalOriginalSize > 0
-            ? Math.round(((totalOriginalSize - totalOptimizedSize) / totalOriginalSize) * 100)
+            ? Math.round((sizeSaved / totalOriginalSize) * 100)
             : 0,
           featuredImageUrl: product.featuredImage?.url || images[0]?.url,
           needsOptimization: optimizationData.score < 70
@@ -778,6 +810,8 @@ export default function ProductOptimization() {
   const [selectedProducts, setSelectedProducts] = useState([]);
   const [error, setError] = useState(loadError);
   const [successMessage, setSuccessMessage] = useState(null);
+  // Which single product is currently being optimized (so only its button spins).
+  const [optimizingId, setOptimizingId] = useState(null);
 
   const isSubmitting = navigation.state === 'submitting';
 
@@ -806,11 +840,13 @@ export default function ProductOptimization() {
     if (actionData?.success) {
       setSuccessMessage(actionData.message);
       setTimeout(() => setSuccessMessage(null), 5000);
+      setOptimizingId(null);
 
       // Reload full product data to reflect the optimization (client re-filters).
       submit({}, { method: 'get' });
     } else if (actionData?.error) {
       setError(actionData.error);
+      setOptimizingId(null);
     }
   }, [actionData, submit]);
 
@@ -836,6 +872,7 @@ export default function ProductOptimization() {
   }, [selectedProducts.length, visibleProducts]);
 
   const handleOptimizeProduct = useCallback((productId) => {
+    setOptimizingId(productId);
     const formData = new FormData();
     formData.append('actionType', 'optimizeProduct');
     formData.append('productId', productId);
@@ -857,8 +894,12 @@ export default function ProductOptimization() {
   };
 
   const formatBytes = (mb) => {
-    if (mb >= 1000) return `${(mb / 1000).toFixed(1)} GB`;
-    return `${mb.toFixed(1)} MB`;
+    const val = Number(mb) || 0;
+    if (val >= 1000) return `${(val / 1000).toFixed(1)} GB`;
+    // Show KB for anything under 1 MB so small (but real) savings don't all
+    // collapse to a confusing "0.0 MB".
+    if (val > 0 && val < 1) return `${Math.max(1, Math.round(val * 1024))} KB`;
+    return `${val.toFixed(1)} MB`;
   };
 
   const filterOptions = [
@@ -1047,7 +1088,7 @@ export default function ProductOptimization() {
                             </BlockStack>
 
                             <BlockStack gap="200">
-                              {product.sizeSavedMB > 0 ? (
+                              {product.optimizedImages > 0 ? (
                                 <>
                                   <Text variant="bodySm" as="p" tone="subdued">Size Saved</Text>
                                   <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
@@ -1076,18 +1117,16 @@ export default function ProductOptimization() {
                             />
                           </BlockStack>
 
-                          {product.needsOptimization && (
-                            <InlineStack align="end">
-                              <Button
-                                variant="primary"
-                                onClick={() => handleOptimizeProduct(product.id)}
-                                loading={isSubmitting}
-                                disabled={isSubmitting}
-                              >
-                                Optimize This Product
-                              </Button>
-                            </InlineStack>
-                          )}
+                          <InlineStack align="end">
+                            <Button
+                              variant={product.needsOptimization ? "primary" : "secondary"}
+                              onClick={() => handleOptimizeProduct(product.id)}
+                              loading={optimizingId === product.id}
+                              disabled={isSubmitting}
+                            >
+                              {product.optimizedImages > 0 ? 'Re-optimize This Product' : 'Optimize This Product'}
+                            </Button>
+                          </InlineStack>
                         </BlockStack>
                       </Box>
                     </InlineStack>
