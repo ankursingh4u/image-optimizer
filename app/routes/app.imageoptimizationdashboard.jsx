@@ -483,7 +483,7 @@ export default function ImageOptimizationDashboard() {
       secondaryActions={[
         {
           content: 'Optimize Products',
-          url: '/app/product-optimization'
+          url: '/app/Productoptimization'
         }
       ]}
     >

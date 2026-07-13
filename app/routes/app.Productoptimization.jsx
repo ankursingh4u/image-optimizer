@@ -217,92 +217,102 @@ export async function loader({ request }) {
 
     const processedProducts = products.map((product) => {
         const images = product.images.edges.map(edge => edge.node);
+        const imageCount = images.length;
         const optimizationData = calculateOptimizationScore(product);
 
-        // Parse the per-image optimization records (key: image_<mediaId>) written
-        // during optimization. Keyed lookup is O(1) and robust to ordering.
-        const optRecords = {};
+        // Parse the per-image optimization records (key: image_<mediaId>) and the
+        // product-level summary written during optimization.
+        const perImage = {}; // key -> { o: originalMB, c: optimizedMB }
         for (const mf of product.metafields.edges) {
-          if (mf.node.key.startsWith('image_')) {
-            try { optRecords[mf.node.key] = JSON.parse(mf.node.value); } catch (e) {}
-          }
+          if (!mf.node.key.startsWith('image_')) continue;
+          try {
+            const rec = JSON.parse(mf.node.value);
+            perImage[mf.node.key] = {
+              o: Number(rec.originalSizeMB) || 0,
+              c: Number(rec.optimizedSizeMB) || 0,
+            };
+          } catch (e) {}
         }
-        // Authoritative product-level summary written at optimize time. Used as a
-        // fallback when the per-image ids no longer match the current media.
         let summary = null;
         const summaryMf = product.metafields.edges.find(mf => mf.node.key === 'optimization_summary');
         if (summaryMf) { try { summary = JSON.parse(summaryMf.node.value); } catch (e) {} }
 
-        let totalOriginalSize = 0;
-        let totalOptimizedSize = 0;
-        let unoptimizedEstimate = 0;
-        let matchedOptimized = 0;
+        // Resolve the REAL optimized totals with a priority chain so savings never
+        // silently collapse to 0. We deliberately do NOT download images here —
+        // doing that on every page load is what made this screen extremely slow.
+        let optimizedCount = 0;
+        let storedOriginal = 0;
+        let storedOptimized = 0;
 
-        // For optimized images, use the real sizes stored during optimization.
-        // For not-yet-optimized images, ESTIMATE the size from the dimensions
-        // (instant, no network) so the UI shows a real number instead of 0.
-        // We deliberately do NOT download images here — doing that on every page
-        // load is what made this screen extremely slow.
+        // Priority 1: per-image records that still match a CURRENT media id (precise).
+        let matched = 0;
         for (const image of images) {
-          const imageKey = `image_${image.id.split('/').pop()}`;
-          const rec = optRecords[imageKey];
-
-          if (rec) {
-            totalOriginalSize += rec.originalSizeMB || 0;
-            totalOptimizedSize += rec.optimizedSizeMB || 0;
-            matchedOptimized++;
-          } else {
-            // Estimated size. Added to BOTH totals so the image shows a size but
-            // contributes 0 to "saved" until it is actually optimized.
-            const est = estimateImageSize(
-              image.width,
-              image.height,
-              getImageFormat(image.url)
-            );
-            totalOriginalSize += est;
-            totalOptimizedSize += est;
-            unoptimizedEstimate += est;
+          const rec = perImage[`image_${image.id.split('/').pop()}`];
+          if (rec && (rec.o > 0 || rec.c > 0)) {
+            storedOriginal += rec.o;
+            storedOptimized += rec.c;
+            matched++;
+          }
+        }
+        if (matched > 0) {
+          optimizedCount = matched;
+        } else if (summary && (Number(summary.totalOriginalSizeMB) > 0 || (summary.optimizedImages || 0) > 0)) {
+          // Priority 2: product-level summary (id-independent, no double counting).
+          optimizedCount = summary.optimizedImages || 0;
+          storedOriginal = Number(summary.totalOriginalSizeMB) || 0;
+          storedOptimized = Number(summary.totalOptimizedSizeMB) || 0;
+          if (!storedOptimized && summary.totalSizeSavedMB != null && storedOriginal) {
+            storedOptimized = storedOriginal - Number(summary.totalSizeSavedMB);
+          }
+        } else {
+          // Priority 3: no current-id match and no summary — sum ALL per-image
+          // records so historical optimizations (keyed by an older id scheme, e.g.
+          // from the previous hosting) still count instead of showing 0.
+          for (const key of Object.keys(perImage)) {
+            const rec = perImage[key];
+            if (rec.o > 0 || rec.c > 0) {
+              storedOriginal += rec.o;
+              storedOptimized += rec.c;
+              optimizedCount++;
+            }
           }
         }
 
-        let optimizedImages = matchedOptimized;
-        let sizeSaved = totalOriginalSize - totalOptimizedSize;
+        optimizedCount = Math.min(optimizedCount, imageCount);
 
-        // Fallback: the product was optimized (summary exists) but none of the
-        // per-image records match the CURRENT media ids — e.g. the images were
-        // re-uploaded/replaced so their ids changed. Trust the stored summary so
-        // real savings still show instead of collapsing to 0.
-        if (matchedOptimized === 0 && summary && (summary.optimizedImages || 0) > 0) {
-          optimizedImages = Math.min(summary.optimizedImages || 0, images.length);
-          const summarySaved = summary.totalSizeSavedMB != null
-            ? summary.totalSizeSavedMB
-            : ((summary.totalOriginalSizeMB || 0) - (summary.totalOptimizedSizeMB || 0));
-          totalOriginalSize = summary.totalOriginalSizeMB || totalOriginalSize;
-          totalOptimizedSize = summary.totalOptimizedSizeMB != null
-            ? summary.totalOptimizedSizeMB
-            : (totalOriginalSize - summarySaved);
-          sizeSaved = summarySaved;
-          unoptimizedEstimate = 0;
+        // Estimate the size of images that have NOT been optimized yet (instant,
+        // no network) so un-optimized products still show a real number and a
+        // potential-savings figure. Treat the largest current images as the
+        // not-yet-optimized ones.
+        const unoptimizedCount = Math.max(imageCount - optimizedCount, 0);
+        let estUnoptimized = 0;
+        if (unoptimizedCount > 0) {
+          const ests = images
+            .map(img => estimateImageSize(img.width, img.height, getImageFormat(img.url)))
+            .sort((a, b) => b - a);
+          estUnoptimized = ests.slice(0, unoptimizedCount).reduce((s, v) => s + v, 0);
         }
+
+        const totalOriginalSize = storedOriginal + estUnoptimized;
+        const totalOptimizedSize = storedOptimized + estUnoptimized; // unoptimized save 0
+        const sizeSaved = Math.max(storedOriginal - storedOptimized, 0);
 
         return {
           id: product.id,
           title: product.title,
           handle: product.handle,
           status: product.status,
-          imageCount: images.length,
+          imageCount,
           ...optimizationData,
-          // Use the size-based optimized count (matches what we can prove was
-          // optimized), falling back to the summary/score-based count.
-          optimizedImages,
+          optimizedImages: optimizedCount,
           totalOriginalSizeMB: totalOriginalSize,
           totalOptimizedSizeMB: totalOptimizedSize,
           sizeSavedMB: sizeSaved,
           // Estimated additional savings if the not-yet-optimized images are
           // optimized (~68% typical reduction with WebP + compression).
-          potentialSavingsMB: unoptimizedEstimate * 0.68,
-          compressionRate: totalOriginalSize > 0
-            ? Math.round((sizeSaved / totalOriginalSize) * 100)
+          potentialSavingsMB: estUnoptimized * 0.68,
+          compressionRate: storedOriginal > 0
+            ? Math.round((sizeSaved / storedOriginal) * 100)
             : 0,
           featuredImageUrl: product.featuredImage?.url || images[0]?.url,
           needsOptimization: optimizationData.score < 70
@@ -504,7 +514,8 @@ export async function action({ request }) {
     
     try {
       // Fetch product media (MediaImage nodes give us the ids the current
-      // GraphQL create/delete mutations require).
+      // GraphQL create/delete mutations require) plus any existing optimization
+      // metafields so we can carry forward the TRUE original size on re-optimize.
       const response = await admin.graphql(
         `#graphql
           query GetProductMedia($id: ID!) {
@@ -525,6 +536,9 @@ export async function action({ request }) {
                   }
                 }
               }
+              metafields(first: 20, namespace: "image_optimization") {
+                edges { node { key value } }
+              }
             }
           }
         `,
@@ -533,6 +547,17 @@ export async function action({ request }) {
 
       const data = await response.json();
       const product = data.data.product;
+
+      // Map existing per-image records by their key so that when we re-optimize
+      // an already-optimized image we keep the ORIGINAL (pre-optimization) size
+      // instead of measuring the already-compressed one — otherwise re-optimizing
+      // would report ~0 savings.
+      const existingByKey = {};
+      for (const edge of (product.metafields?.edges || [])) {
+        if (!edge.node.key.startsWith('image_')) continue;
+        try { existingByKey[edge.node.key] = JSON.parse(edge.node.value); } catch (e) {}
+      }
+
       const images = product.media.edges
         .map(edge => edge.node)
         .filter(node => node && node.mediaContentType === 'IMAGE' && node.image && node.image.url)
@@ -547,7 +572,20 @@ export async function action({ request }) {
           // Optimize image with Sharp. This downloads the original once and
           // returns its size, so we don't fetch the image a second time.
           const optimizationData = await optimizeImage(image.url, format);
-          const originalSizeMB = optimizationData.originalSizeMB;
+
+          // Carry forward the TRUE original size. If this image is itself the
+          // output of a previous optimization, its existing record holds the real
+          // pre-optimization size — keep the larger of that and what we just
+          // measured, so re-optimizing an already-small image still reflects the
+          // full saving instead of ~0.
+          const prevRec = existingByKey[`image_${image.id.split('/').pop()}`];
+          const measuredOriginalMB = optimizationData.originalSizeMB;
+          const originalSizeMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
+            ? Number(prevRec.originalSizeMB)
+            : measuredOriginalMB;
+          const compressionRate = originalSizeMB > 0
+            ? Math.round(((originalSizeMB - optimizationData.optimizedSizeMB) / originalSizeMB) * 100)
+            : optimizationData.compressionRate;
 
           // Generate AI alt text if missing
           let altText = image.altText;
@@ -599,7 +637,7 @@ export async function action({ request }) {
                     value: JSON.stringify({
                       originalSizeMB: originalSizeMB,
                       optimizedSizeMB: optimizationData.optimizedSizeMB,
-                      compressionRate: optimizationData.compressionRate,
+                      compressionRate: compressionRate,
                       format: format,
                       altText: altText,
                       optimizedAt: new Date().toISOString(),
@@ -618,7 +656,7 @@ export async function action({ request }) {
             originalImageId: image.id,
             originalSize: originalSizeMB,
             optimizedSize: optimizationData.optimizedSizeMB,
-            compressionRate: optimizationData.compressionRate,
+            compressionRate: compressionRate,
             altText,
             success: true
           });
