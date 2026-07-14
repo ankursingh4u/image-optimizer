@@ -220,22 +220,41 @@ export async function loader({ request }) {
         const imageCount = images.length;
         const optimizationData = calculateOptimizationScore(product);
 
-        // Parse the per-image optimization records (key: image_<mediaId>) and the
-        // product-level summary written during optimization.
-        const perImage = {}; // key -> { o: originalMB, c: optimizedMB }
+        // Parse the per-image optimization records, indexed by the media id of the
+        // image they produced (that id is the metafield key suffix). Keeping the
+        // FULL record lets us walk an image's re-optimization history.
+        const recByOutId = {}; // shortMediaId -> full record object
         for (const mf of product.metafields.edges) {
           if (!mf.node.key.startsWith('image_')) continue;
           try {
-            const rec = JSON.parse(mf.node.value);
-            perImage[mf.node.key] = {
-              o: Number(rec.originalSizeMB) || 0,
-              c: Number(rec.optimizedSizeMB) || 0,
-            };
+            recByOutId[mf.node.key.slice('image_'.length)] = JSON.parse(mf.node.value);
           } catch (e) {}
         }
         let summary = null;
         const summaryMf = product.metafields.edges.find(mf => mf.node.key === 'optimization_summary');
         if (summaryMf) { try { summary = JSON.parse(summaryMf.node.value); } catch (e) {} }
+
+        // For a current image, resolve its CURRENT optimized size and its TRUE
+        // original size by walking back through re-optimization records. When an
+        // image is optimized more than once, the newest record's "original" is the
+        // already-small size; the true original lives in an older record in the
+        // chain (linked via originalImageId). We take the largest original seen.
+        const resolveImage = (shortId) => {
+          const rec = recByOutId[shortId];
+          if (!rec) return null;
+          const optimized = Number(rec.optimizedSizeMB) || 0;
+          let trueOriginal = Number(rec.originalSizeMB) || 0;
+          let cursor = rec;
+          let guard = 0;
+          while (cursor && cursor.originalImageId && guard++ < 25) {
+            const pid = String(cursor.originalImageId).split('/').pop();
+            const prev = recByOutId[pid];
+            if (!prev || prev === cursor) break;
+            trueOriginal = Math.max(trueOriginal, Number(prev.originalSizeMB) || 0);
+            cursor = prev;
+          }
+          return { original: trueOriginal, optimized };
+        };
 
         // Resolve the REAL optimized totals with a priority chain so savings never
         // silently collapse to 0. We deliberately do NOT download images here —
@@ -244,13 +263,14 @@ export async function loader({ request }) {
         let storedOriginal = 0;
         let storedOptimized = 0;
 
-        // Priority 1: per-image records that still match a CURRENT media id (precise).
+        // Priority 1: per-image records that match a CURRENT media id (precise),
+        // resolved through their full re-optimization history.
         let matched = 0;
         for (const image of images) {
-          const rec = perImage[`image_${image.id.split('/').pop()}`];
-          if (rec && (rec.o > 0 || rec.c > 0)) {
-            storedOriginal += rec.o;
-            storedOptimized += rec.c;
+          const r = resolveImage(image.id.split('/').pop());
+          if (r && (r.original > 0 || r.optimized > 0)) {
+            storedOriginal += r.original;
+            storedOptimized += r.optimized;
             matched++;
           }
         }
@@ -265,20 +285,33 @@ export async function loader({ request }) {
             storedOptimized = storedOriginal - Number(summary.totalSizeSavedMB);
           }
         } else {
-          // Priority 3: no current-id match and no summary — sum ALL per-image
-          // records so historical optimizations (keyed by an older id scheme, e.g.
-          // from the previous hosting) still count instead of showing 0.
-          for (const key of Object.keys(perImage)) {
-            const rec = perImage[key];
-            if (rec.o > 0 || rec.c > 0) {
-              storedOriginal += rec.o;
-              storedOptimized += rec.c;
+          // Priority 3: no current-id match and no summary — use the single largest
+          // recorded original vs its optimized size so a historical optimization
+          // (keyed by an older id scheme) still surfaces instead of showing 0.
+          for (const rec of Object.values(recByOutId)) {
+            const o = Number(rec.originalSizeMB) || 0;
+            const c = Number(rec.optimizedSizeMB) || 0;
+            if (o > 0 || c > 0) {
+              storedOriginal += o;
+              storedOptimized += c;
               optimizedCount++;
             }
           }
         }
 
         optimizedCount = Math.min(optimizedCount, imageCount);
+
+        // Safety net for single-image products: every record belongs to that one
+        // image's history, so the true original is simply the largest original ever
+        // recorded. Recovers the real size even when re-optimization records don't
+        // link back via originalImageId.
+        if (imageCount === 1 && matched === 1) {
+          let maxOrig = 0;
+          for (const rec of Object.values(recByOutId)) {
+            maxOrig = Math.max(maxOrig, Number(rec.originalSizeMB) || 0);
+          }
+          if (maxOrig > storedOriginal) storedOriginal = maxOrig;
+        }
 
         // Estimate the size of images that have NOT been optimized yet (instant,
         // no network) so un-optimized products still show a real number and a
@@ -296,6 +329,12 @@ export async function loader({ request }) {
         const totalOriginalSize = storedOriginal + estUnoptimized;
         const totalOptimizedSize = storedOptimized + estUnoptimized; // unoptimized save 0
         const sizeSaved = Math.max(storedOriginal - storedOptimized, 0);
+
+        // TEMP DIAGNOSTIC: verify chain-walk recovers true original. Remove after.
+        if (optimizedCount > 0) {
+          const recDump = Object.entries(recByOutId).map(([k, r]) => `${k.slice(0,10)}:o=${(Number(r.originalSizeMB)||0).toFixed(3)},c=${(Number(r.optimizedSizeMB)||0).toFixed(3)},from=${String(r.originalImageId||'').split('/').pop().slice(0,10)}`);
+          console.log(`[optdiag2] "${product.title}" storedOrig=${storedOriginal.toFixed(3)} storedOpt=${storedOptimized.toFixed(3)} saved=${sizeSaved.toFixed(3)} recs=[${recDump.join(' | ')}]`);
+        }
 
         // Estimated size reduction vs a typical UN-optimized upload of the same
         // dimensions. Baseline = standard JPEG weight; target = optimized WebP
