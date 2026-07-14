@@ -1298,9 +1298,9 @@ export default function ProductOptimization() {
                             </BlockStack>
 
                             <BlockStack gap="200">
-                              <Text variant="bodySm" as="p" tone="subdued">Size Reduced</Text>
+                              <Text variant="bodySm" as="p" tone="subdued">Optimized Size</Text>
                               <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
-                                {product.isEstimate ? '~' : ''}{formatBytes(product.sizeSavedMB)} ({product.compressionRate}%)
+                                {product.isEstimate ? '~' : ''}{formatBytes(product.totalOptimizedSizeMB)} (↓{product.compressionRate}%)
                               </Text>
                             </BlockStack>
                           </InlineStack>
