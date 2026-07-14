@@ -1107,21 +1107,18 @@ export default function ProductOptimization() {
             </Box>
             <Box width="25%">
               <Card>
-                <BlockStack gap="200">
-                  <Text variant="bodyMd" as="p" tone="subdued">Total Size Reduced</Text>
-                  {stats.potentialSavingsMB >= 0.01 ? (
+                {stats.potentialSavingsMB >= 0.01 ? (
+                  <BlockStack gap="200">
+                    <Text variant="bodyMd" as="p" tone="subdued">Total Size Reduced</Text>
                     <Text variant="heading2xl" as="h2" tone="success">{formatBytes(stats.potentialSavingsMB)}</Text>
-                  ) : (
-                    <BlockStack gap="100">
-                      <Text variant="heading2xl" as="h2" tone="success">✓</Text>
-                      <Text variant="bodySm" as="p" tone="subdued">
-                        {stats.optimizedImagesCount > 0
-                          ? `${stats.optimizedImagesCount} images already optimized`
-                          : 'Optimize large images to see savings'}
-                      </Text>
-                    </BlockStack>
-                  )}
-                </BlockStack>
+                  </BlockStack>
+                ) : (
+                  <BlockStack gap="200">
+                    <Text variant="bodyMd" as="p" tone="subdued">Images Optimized</Text>
+                    <Text variant="heading2xl" as="h2" tone="success">{stats.optimizedImagesCount}</Text>
+                    <Text variant="bodySm" as="p" tone="subdued">of {stats.totalImages} total</Text>
+                  </BlockStack>
+                )}
               </Card>
             </Box>
           </InlineStack>
