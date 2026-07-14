@@ -345,11 +345,16 @@ export async function loader({ request }) {
         const estReducedMB = Math.max(estOriginalMB - currentSizeMB, 0);
 
         // Prefer REAL measured numbers when the app actually compressed a larger
-        // image; otherwise fall back to the estimate so the columns never show 0.
+        // image; otherwise fall back to the estimate — but ONLY for products the
+        // app has actually optimized. Un-optimized products must NOT show a
+        // reduction (they show current size + potential savings instead).
+        const isOptimizedProduct = optimizedCount > 0;
         const hasReal = measuredSaved >= 0.01;
         const displayOriginalMB = hasReal ? (storedOriginal + estUnoptimized) : estOriginalMB;
-        const displayReducedMB = hasReal ? measuredSaved : estReducedMB;
-        const displayRate = displayOriginalMB > 0
+        const displayReducedMB = hasReal
+          ? measuredSaved
+          : (isOptimizedProduct ? estReducedMB : 0);
+        const displayRate = (isOptimizedProduct && displayOriginalMB > 0)
           ? Math.round((displayReducedMB / displayOriginalMB) * 100)
           : 0;
 
@@ -377,6 +382,8 @@ export async function loader({ request }) {
           imageCount,
           ...optimizationData,
           optimizedImages: optimizedCount,
+          // Whether the app has optimized this product at all (has records).
+          isOptimized: optimizedCount > 0,
           // Whether the shown Original/Reduced are estimated (no measured original)
           // or measured (the app actually compressed a larger image).
           isEstimate: !hasReal,
@@ -1290,19 +1297,39 @@ export default function ProductOptimization() {
                               </Text>
                             </BlockStack>
 
-                            <BlockStack gap="200">
-                              <Text variant="bodySm" as="p" tone="subdued">Original Size</Text>
-                              <Text variant="bodyMd" as="p" fontWeight="semibold">
-                                {product.isEstimate ? '~' : ''}{formatBytes(product.totalOriginalSizeMB)}
-                              </Text>
-                            </BlockStack>
+                            {product.isOptimized ? (
+                              <>
+                                <BlockStack gap="200">
+                                  <Text variant="bodySm" as="p" tone="subdued">Original Size</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold">
+                                    {product.isEstimate ? '~' : ''}{formatBytes(product.totalOriginalSizeMB)}
+                                  </Text>
+                                </BlockStack>
 
-                            <BlockStack gap="200">
-                              <Text variant="bodySm" as="p" tone="subdued">Optimized Size</Text>
-                              <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
-                                {product.isEstimate ? '~' : ''}{formatBytes(product.totalOptimizedSizeMB)} (↓{product.compressionRate}%)
-                              </Text>
-                            </BlockStack>
+                                <BlockStack gap="200">
+                                  <Text variant="bodySm" as="p" tone="subdued">Optimized Size</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold" tone="success">
+                                    {product.isEstimate ? '~' : ''}{formatBytes(product.totalOptimizedSizeMB)} (↓{product.compressionRate}%)
+                                  </Text>
+                                </BlockStack>
+                              </>
+                            ) : (
+                              <>
+                                <BlockStack gap="200">
+                                  <Text variant="bodySm" as="p" tone="subdued">Current Size</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold">
+                                    ~{formatBytes(product.totalOptimizedSizeMB)}
+                                  </Text>
+                                </BlockStack>
+
+                                <BlockStack gap="200">
+                                  <Text variant="bodySm" as="p" tone="subdued">Potential Savings</Text>
+                                  <Text variant="bodyMd" as="p" fontWeight="semibold">
+                                    ~{formatBytes(product.potentialSavingsMB)}
+                                  </Text>
+                                </BlockStack>
+                              </>
+                            )}
                           </InlineStack>
 
                           <BlockStack gap="200">
