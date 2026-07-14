@@ -297,6 +297,19 @@ export async function loader({ request }) {
         const totalOptimizedSize = storedOptimized + estUnoptimized; // unoptimized save 0
         const sizeSaved = Math.max(storedOriginal - storedOptimized, 0);
 
+        // Estimated size reduction vs a typical UN-optimized upload of the same
+        // dimensions. Baseline = standard JPEG weight; target = optimized WebP
+        // weight. This powers the store-wide "estimated savings" metric so the
+        // dashboard shows the value of keeping images optimized even when no
+        // further measured reduction is available.
+        let estBaseline = 0;
+        let estTarget = 0;
+        for (const img of images) {
+          estBaseline += estimateImageSize(img.width, img.height, 'jpg');
+          estTarget += estimateImageSize(img.width, img.height, 'webp');
+        }
+        const estimatedSavingsMB = Math.max(estBaseline - estTarget, 0);
+
         // A product counts as "already optimized" when it has optimization
         // records but there is essentially no further saving available (its images
         // are already small/compressed). Used by the UI to show an honest state
@@ -318,6 +331,7 @@ export async function loader({ request }) {
           // Estimated additional savings if the not-yet-optimized images are
           // optimized (~68% typical reduction with WebP + compression).
           potentialSavingsMB: estUnoptimized * 0.68,
+          estimatedSavingsMB,
           compressionRate: storedOriginal > 0
             ? Math.round((sizeSaved / storedOriginal) * 100)
             : 0,
@@ -342,6 +356,7 @@ export async function loader({ request }) {
         totalImages: processedProducts.reduce((sum, p) => sum + p.imageCount, 0),
         totalSizeMB: processedProducts.reduce((sum, p) => sum + p.totalOriginalSizeMB, 0),
         potentialSavingsMB: processedProducts.reduce((sum, p) => sum + p.sizeSavedMB, 0),
+        estimatedSavingsMB: processedProducts.reduce((sum, p) => sum + (p.estimatedSavingsMB || 0), 0),
         optimizedImagesCount: processedProducts.reduce((sum, p) => sum + (p.optimizedImages || 0), 0)
       },
       error: null
@@ -359,6 +374,7 @@ export async function loader({ request }) {
         totalImages: 0,
         totalSizeMB: 0,
         potentialSavingsMB: 0,
+        estimatedSavingsMB: 0,
         optimizedImagesCount: 0
       },
       error: 'Failed to load products'
@@ -1108,8 +1124,14 @@ export default function ProductOptimization() {
             <Box width="25%">
               <Card>
                 <BlockStack gap="200">
-                  <Text variant="bodyMd" as="p" tone="subdued">Total Size Reduced</Text>
-                  <Text variant="heading2xl" as="h2" tone="success">{formatBytes(stats.potentialSavingsMB)}</Text>
+                  <Text variant="bodyMd" as="p" tone="subdued">
+                    {stats.potentialSavingsMB >= 0.01 ? 'Total Size Reduced' : 'Total Size Reduced (est.)'}
+                  </Text>
+                  <Text variant="heading2xl" as="h2" tone="success">
+                    {stats.potentialSavingsMB >= 0.01
+                      ? formatBytes(stats.potentialSavingsMB)
+                      : '~' + formatBytes(stats.estimatedSavingsMB)}
+                  </Text>
                 </BlockStack>
               </Card>
             </Box>
