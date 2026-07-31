@@ -16,6 +16,11 @@ import {
   Banner,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
+import {
+  resolveBillingMode,
+  shopIsGated,
+  findActiveSubscription,
+} from "../billing.server";
 
 // Import Polaris styles - THIS IS CRITICAL
 import "@shopify/polaris/build/esm/styles.css";
@@ -27,27 +32,14 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   // --- Billing gate (code-managed billing) --------------------------------
-  // Controlled entirely by env vars so we can test billing safely before
-  // charging real merchants. Defaults are deliberately non-disruptive:
-  //   BILLING_ENFORCED   "true" -> require a subscription for EVERY shop.
-  //                      anything else (default) -> only gate BILLING_TEST_SHOPS.
-  //   BILLING_TEST_SHOPS comma-separated shop domains to gate while testing,
-  //                      e.g. "optimizer-testing.myshopify.com".
-  //   BILLING_TEST_MODE  "false" -> real charges. Anything else (default) ->
-  //                      test charges (no real money; works on dev/test stores).
-  // With the defaults, existing live merchants are NOT affected.
-  // eslint-disable-next-line no-undef
-  const env = process.env;
-  const enforceAll = env.BILLING_ENFORCED === "true";
-  const testShops = (env.BILLING_TEST_SHOPS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const isTest = env.BILLING_TEST_MODE !== "false";
-  const shopIsGated = enforceAll || testShops.includes(session.shop);
+  // All the env-var logic lives in app/billing.server.js so the gate, the
+  // subscribe action and the plan page can't drift apart. Shops that installed
+  // before enforcement was switched on are grandfathered and never gated.
+  const { isTest } = resolveBillingMode(session.shop);
+  const gated = await shopIsGated(session.shop);
 
   let needsSubscription = false;
-  if (shopIsGated) {
+  if (gated) {
     // Check active subscriptions via the admin GraphQL client (same auth path as
     // the subscribe action — avoids the offline-token 401 seen with billing.*).
     // We do NOT redirect here; if there's no active subscription we render our
@@ -62,13 +54,9 @@ export const loader = async ({ request }) => {
     );
     const subs =
       (await resp.json())?.data?.currentAppInstallation?.activeSubscriptions || [];
-    // In test mode only test subscriptions count; in live mode only live ones.
-    const active = subs.filter(
-      (s) => s.status === "ACTIVE" && Boolean(s.test) === isTest
-    );
-    needsSubscription = active.length === 0;
+    needsSubscription = !findActiveSubscription(subs, isTest);
     console.log(
-      "[billing][debug] shop=%s isTest=%s subs=%s",
+      "[billing][debug] shop=%s gated isTest=%s subs=%s",
       session.shop,
       isTest,
       JSON.stringify(subs)
@@ -78,7 +66,8 @@ export const loader = async ({ request }) => {
   }
   // ------------------------------------------------------------------------
 
-  return { apiKey: env.SHOPIFY_API_KEY || "", needsSubscription };
+  // eslint-disable-next-line no-undef
+  return { apiKey: process.env.SHOPIFY_API_KEY || "", needsSubscription };
 };
 
 const PLAN_FEATURES = [

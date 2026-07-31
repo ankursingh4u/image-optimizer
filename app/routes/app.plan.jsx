@@ -15,6 +15,7 @@ import {
   Modal,
 } from "@shopify/polaris";
 import { authenticate, BASIC_PLAN } from "../shopify.server";
+import { resolveBillingMode, findActiveSubscription } from "../billing.server";
 
 /**
  * Plan page (/app/plan).
@@ -42,9 +43,8 @@ import { authenticate, BASIC_PLAN } from "../shopify.server";
  * than taken from the form, so a crafted request can't cancel an arbitrary id.
  */
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
-  // eslint-disable-next-line no-undef
-  const isTest = process.env.BILLING_TEST_MODE !== "false";
+  const { admin, session } = await authenticate.admin(request);
+  const { isTest } = resolveBillingMode(session.shop);
 
   const lookup = await admin.graphql(
     `#graphql
@@ -57,9 +57,7 @@ export const action = async ({ request }) => {
   const subs =
     (await lookup.json())?.data?.currentAppInstallation?.activeSubscriptions ||
     [];
-  const target = subs.find(
-    (s) => s.status === "ACTIVE" && Boolean(s.test) === isTest
-  );
+  const target = findActiveSubscription(subs, isTest);
 
   if (!target) {
     return { cancelError: "There's no active subscription to cancel." };
@@ -96,11 +94,10 @@ export const action = async ({ request }) => {
   );
   return { cancelled: true };
 };
+
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
-  // eslint-disable-next-line no-undef
-  const env = process.env;
-  const isTest = env.BILLING_TEST_MODE !== "false";
+  const { isTest } = resolveBillingMode(session.shop);
   const store = session.shop.replace(".myshopify.com", "");
 
   let subscription = null;
@@ -134,10 +131,7 @@ export const loader = async ({ request }) => {
         }`
     );
     const data = (await resp.json())?.data?.currentAppInstallation;
-    const subs = data?.activeSubscriptions || [];
-    // Match the gate in app.jsx: in test mode only test subs count, and vice versa.
-    subscription =
-      subs.find((s) => s.status === "ACTIVE" && Boolean(s.test) === isTest) || null;
+    subscription = findActiveSubscription(data?.activeSubscriptions, isTest);
   } catch (err) {
     console.error("[plan] subscription lookup failed:", err?.message);
     loadError = "We couldn't load your subscription details right now.";

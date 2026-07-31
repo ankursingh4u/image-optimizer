@@ -13,6 +13,19 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// Shops that were already installed when code-managed billing enforcement was
+/// switched on. These keep full access without a subscription — they installed
+/// under a free app and shouldn't be locked out retroactively.
+///
+/// Populated once by scripts/backfill-grandfather.mjs from the Session table.
+/// Absence of a row means "not grandfathered", so the backfill MUST run (and be
+/// verified) before BILLING_ENFORCED is set to true.
+model GrandfatheredShop {
+  shop            String   @id
+  grandfatheredAt DateTime @default(now())
+  reason          String?
+}
+
 model Session {
   id            String    @id
   shop          String

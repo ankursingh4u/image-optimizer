@@ -1,4 +1,5 @@
 import { authenticate, BASIC_PLAN } from "../shopify.server";
+import { resolveBillingMode } from "../billing.server";
 
 /**
  * Subscribe action. Creates the Basic subscription directly via the admin
@@ -14,7 +15,10 @@ export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   // eslint-disable-next-line no-undef
   const env = process.env;
-  const isTest = env.BILLING_TEST_MODE !== "false";
+  // isTest=false means a REAL charge. Resolved centrally so a listed test shop
+  // (e.g. a dev store, which Shopify won't let us charge for real) stays on
+  // test charges even after the app goes live.
+  const { isTest } = resolveBillingMode(session.shop);
   const store = session.shop.replace(".myshopify.com", "");
 
   // Return the merchant into the embedded app after approval.
