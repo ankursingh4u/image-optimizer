@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import {
   Page,
@@ -12,20 +12,90 @@ import {
   Divider,
   Banner,
   List,
+  Modal,
 } from "@shopify/polaris";
 import { authenticate, BASIC_PLAN } from "../shopify.server";
 
 /**
  * Plan page (/app/plan).
  *
- * Read-only view of the merchant's current subscription, plus the same
- * "start trial" action used by the billing gate in app.jsx. This route exists
- * because the pricing UI previously only rendered as a *gate* — once a shop was
+ * Shows the merchant's current subscription, the "start trial" action used by
+ * the billing gate in app.jsx, and an in-app cancel. This route exists because
+ * the pricing UI previously only rendered as a *gate* — once a shop was
  * subscribed (or simply not gated) there was no way to reach it at all.
  *
- * Deliberately does NOT change any gating/enforcement behaviour: it only reads
- * activeSubscriptions and reuses the existing /app/subscribe action.
+ * Does NOT change any gating/enforcement behaviour: it reads activeSubscriptions
+ * and reuses the existing /app/subscribe action. The only write it performs is
+ * the merchant-initiated cancel below.
  */
+
+/**
+ * Cancel the merchant's active subscription.
+ *
+ * Shopify offers no hosted plan page for code-managed billing, so cancellation
+ * has to live in the app. Deliberately called WITHOUT prorate: prorating issues
+ * the merchant a credit and deducts the same amount from the Partner account,
+ * which is a revenue decision we shouldn't make silently. Without it the
+ * subscription simply stops renewing.
+ *
+ * The subscription id is re-read from activeSubscriptions server-side rather
+ * than taken from the form, so a crafted request can't cancel an arbitrary id.
+ */
+export const action = async ({ request }) => {
+  const { admin } = await authenticate.admin(request);
+  // eslint-disable-next-line no-undef
+  const isTest = process.env.BILLING_TEST_MODE !== "false";
+
+  const lookup = await admin.graphql(
+    `#graphql
+      query ActiveSubForCancel {
+        currentAppInstallation {
+          activeSubscriptions { id status test }
+        }
+      }`
+  );
+  const subs =
+    (await lookup.json())?.data?.currentAppInstallation?.activeSubscriptions ||
+    [];
+  const target = subs.find(
+    (s) => s.status === "ACTIVE" && Boolean(s.test) === isTest
+  );
+
+  if (!target) {
+    return { cancelError: "There's no active subscription to cancel." };
+  }
+
+  const resp = await admin.graphql(
+    `#graphql
+      mutation CancelSubscription($id: ID!) {
+        appSubscriptionCancel(id: $id) {
+          appSubscription { id status }
+          userErrors { field message }
+        }
+      }`,
+    { variables: { id: target.id } }
+  );
+
+  const json = await resp.json();
+  const result = json?.data?.appSubscriptionCancel;
+  const userErrors = result?.userErrors || [];
+
+  if (userErrors.length || !result?.appSubscription) {
+    console.error("[plan] cancel failed:", JSON.stringify(json));
+    return {
+      cancelError:
+        "Could not cancel the subscription: " +
+        (userErrors.map((e) => e.message).join("; ") || "unexpected response"),
+    };
+  }
+
+  console.log(
+    "[plan] cancelled subscription %s -> %s",
+    result.appSubscription.id,
+    result.appSubscription.status
+  );
+  return { cancelled: true };
+};
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   // eslint-disable-next-line no-undef
@@ -109,6 +179,23 @@ export default function Plan() {
   const confirmationUrl = fetcher.data?.confirmationUrl;
   const error = fetcher.data?.error;
   const subscribing = fetcher.state !== "idle" || Boolean(confirmationUrl);
+
+  // Separate fetcher so the cancel flow can't be confused with the subscribe
+  // flow's state (and so a failed cancel doesn't blank the subscribe button).
+  const cancelFetcher = useFetcher();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const cancelling = cancelFetcher.state !== "idle";
+  const cancelError = cancelFetcher.data?.cancelError;
+  const cancelled = cancelFetcher.data?.cancelled;
+
+  // Close the confirmation dialog once the cancel round-trips. The route's
+  // loader revalidates automatically, so `subscription` becomes null and the
+  // page falls back to the subscribe CTA on its own.
+  useEffect(() => {
+    if (cancelFetcher.state === "idle" && cancelFetcher.data) {
+      setConfirmOpen(false);
+    }
+  }, [cancelFetcher.state, cancelFetcher.data]);
 
   useEffect(() => {
     if (!confirmationUrl) return;
@@ -220,17 +307,31 @@ export default function Plan() {
               <Divider />
 
               {error ? <Banner tone="critical">{error}</Banner> : null}
+              {cancelError ? (
+                <Banner tone="critical">{cancelError}</Banner>
+              ) : null}
+              {cancelled && !subscription ? (
+                <Banner tone="success">
+                  Your subscription has been cancelled.
+                </Banner>
+              ) : null}
 
               {subscription ? (
                 <BlockStack gap="200">
-                  <Button size="large" onClick={openBilling}>
-                    View billing in Shopify
-                  </Button>
+                  <InlineStack gap="200">
+                    <Button onClick={openBilling}>View billing in Shopify</Button>
+                    <Button
+                      tone="critical"
+                      loading={cancelling}
+                      disabled={cancelling}
+                      onClick={() => setConfirmOpen(true)}
+                    >
+                      Cancel subscription
+                    </Button>
+                  </InlineStack>
                   <Text variant="bodySm" as="p" tone="subdued">
                     Billing is handled by Shopify — this subscription appears on
                     your regular Shopify invoice under Settings &rsaquo; Billing.
-                    To stop future charges, uninstall the app from your Shopify
-                    admin.
                   </Text>
                 </BlockStack>
               ) : (
@@ -274,7 +375,7 @@ export default function Plan() {
                   Good to know
                 </Text>
                 <List>
-                  <List.Item>Cancel any time from your Shopify admin.</List.Item>
+                  <List.Item>Cancel any time from this page.</List.Item>
                   <List.Item>
                     Charges appear on your regular Shopify invoice.
                   </List.Item>
@@ -283,6 +384,40 @@ export default function Plan() {
             </Card>
           </Layout.Section>
         ) : null}
+
+        <Modal
+          open={confirmOpen}
+          onClose={() => setConfirmOpen(false)}
+          title="Cancel subscription?"
+          primaryAction={{
+            content: "Cancel subscription",
+            destructive: true,
+            loading: cancelling,
+            onAction: () =>
+              cancelFetcher.submit({}, { method: "post", action: "/app/plan" }),
+          }}
+          secondaryActions={[
+            {
+              content: "Keep subscription",
+              disabled: cancelling,
+              onAction: () => setConfirmOpen(false),
+            },
+          ]}
+        >
+          <Modal.Section>
+            <BlockStack gap="200">
+              <Text as="p" variant="bodyMd">
+                This stops future billing for the {subscription?.name || planName}{" "}
+                plan. No refund or prorated credit is issued for the current
+                billing period.
+              </Text>
+              <Text as="p" variant="bodyMd" tone="subdued">
+                You can resubscribe from this page at any time, though the 3-day
+                free trial only applies to a first subscription.
+              </Text>
+            </BlockStack>
+          </Modal.Section>
+        </Modal>
       </Layout>
     </Page>
   );
