@@ -185,6 +185,7 @@ export default function App() {
               {/* <a href="/app/imageoptimizationdashboard">Image Optimization Dashboard</a> */}
               <a href="/app/productoptimization">Image Optimization Dashboard</a>
               <a href="/app/pagespeedimpactreports">Page Speed Reports</a>
+              <a href="/app/plan">Plan</a>
             </ui-nav-menu>
             <Outlet />
           </>
