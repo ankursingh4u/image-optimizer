@@ -34,7 +34,6 @@ export const loader = async ({ request }) => {
   const store = session.shop.replace(".myshopify.com", "");
 
   let subscription = null;
-  let appHandle = null;
   let loadError = null;
 
   try {
@@ -42,7 +41,6 @@ export const loader = async ({ request }) => {
       `#graphql
         query PlanStatus {
           currentAppInstallation {
-            app { handle }
             activeSubscriptions {
               id
               name
@@ -66,7 +64,6 @@ export const loader = async ({ request }) => {
         }`
     );
     const data = (await resp.json())?.data?.currentAppInstallation;
-    appHandle = data?.app?.handle || null;
     const subs = data?.activeSubscriptions || [];
     // Match the gate in app.jsx: in test mode only test subs count, and vice versa.
     subscription =
@@ -76,11 +73,14 @@ export const loader = async ({ request }) => {
     loadError = "We couldn't load your subscription details right now.";
   }
 
-  const managePlanUrl = appHandle
-    ? `https://admin.shopify.com/store/${store}/charges/${appHandle}/pricing_plans`
-    : null;
+  // NOTE: do NOT link to /charges/<handle>/pricing_plans — that page only exists
+  // for apps using Shopify *managed pricing*. This app uses code-managed billing
+  // (appSubscriptionCreate), so Shopify hosts no per-app plan page and that URL
+  // 404s. Settings > Billing is a core admin route and is where app charges and
+  // subscriptions are listed for the merchant.
+  const billingUrl = `https://admin.shopify.com/store/${store}/settings/billing`;
 
-  return { subscription, managePlanUrl, isTest, planName: BASIC_PLAN, loadError };
+  return { subscription, billingUrl, isTest, planName: BASIC_PLAN, loadError };
 };
 
 const PLAN_FEATURES = [
@@ -103,7 +103,7 @@ function formatDate(value) {
 }
 
 export default function Plan() {
-  const { subscription, managePlanUrl, isTest, planName, loadError } =
+  const { subscription, billingUrl, isTest, planName, loadError } =
     useLoaderData();
   const fetcher = useFetcher();
   const confirmationUrl = fetcher.data?.confirmationUrl;
@@ -129,10 +129,10 @@ export default function Plan() {
   const renewsOn = formatDate(subscription?.currentPeriodEnd);
   const startedOn = formatDate(subscription?.createdAt);
 
-  const openManagePlan = () => {
-    if (!managePlanUrl) return;
+  const openBilling = () => {
+    if (!billingUrl) return;
     const a = document.createElement("a");
-    a.href = managePlanUrl;
+    a.href = billingUrl;
     a.target = "_top";
     document.body.appendChild(a);
     a.click();
@@ -223,16 +223,14 @@ export default function Plan() {
 
               {subscription ? (
                 <BlockStack gap="200">
-                  <Button
-                    size="large"
-                    disabled={!managePlanUrl}
-                    onClick={openManagePlan}
-                  >
-                    Manage plan in Shopify
+                  <Button size="large" onClick={openBilling}>
+                    View billing in Shopify
                   </Button>
                   <Text variant="bodySm" as="p" tone="subdued">
-                    Billing is handled by Shopify. You can view invoices or
-                    cancel from your Shopify admin.
+                    Billing is handled by Shopify — this subscription appears on
+                    your regular Shopify invoice under Settings &rsaquo; Billing.
+                    To stop future charges, uninstall the app from your Shopify
+                    admin.
                   </Text>
                 </BlockStack>
               ) : (
