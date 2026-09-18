@@ -2,6 +2,13 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useLoaderData, useSubmit, useNavigation, useActionData } from 'react-router';
 import { authenticate } from '../shopify.server';
 import {
+  quotaContext,
+  checkQuota,
+  recordUsage,
+  quotaMessage,
+  METRICS,
+} from '../usage.server';
+import {
   Page,
   Layout,
   Card,
@@ -588,13 +595,28 @@ async function uploadAndReplaceImage(admin, productId, oldMediaId, optimizedBuff
 }
 
 export async function action({ request }) {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const actionType = formData.get('actionType');
 
   if (actionType === 'optimizeProduct') {
     const productId = formData.get('productId');
-    
+
+    // How many images this product needs isn't known until we've fetched it, so
+    // we can't reserve the exact amount up front. Requiring one unit of headroom
+    // and recording the true count afterwards stops a shop at its limit from
+    // starting new work, without ever abandoning a product halfway through.
+    // Bulk optimization re-enters this same branch per product, so it inherits
+    // the check without needing one of its own.
+    const quota = await quotaContext(admin, session);
+    const headroom = await checkQuota(quota, METRICS.IMAGES_OPTIMIZED, 1);
+    if (!headroom.allowed) {
+      return {
+        success: false,
+        error: quotaMessage(METRICS.IMAGES_OPTIMIZED, headroom),
+      };
+    }
+
     try {
       // Fetch product media (MediaImage nodes give us the ids the current
       // GraphQL create/delete mutations require) plus any existing optimization
@@ -881,6 +903,11 @@ export async function action({ request }) {
       const compressed = successfulOptimizations.filter(r => !r.alreadyOptimized);
       const skipped = successfulOptimizations.filter(r => r.alreadyOptimized);
       const totalSaved = compressed.reduce((sum, r) => sum + Math.max(r.originalSize - r.optimizedSize, 0), 0);
+
+      // Only images we actually re-encoded and uploaded count against the quota.
+      // Ones already at their smallest cost nothing, so charging for them would
+      // penalise a merchant for re-running the optimizer.
+      await recordUsage(session.shop, METRICS.IMAGES_OPTIMIZED, compressed.length);
 
       let message;
       if (compressed.length > 0) {

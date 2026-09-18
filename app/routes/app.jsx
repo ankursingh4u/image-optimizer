@@ -1,25 +1,14 @@
-import { useEffect } from "react";
-import { Outlet, useLoaderData, useRouteError, useFetcher } from "react-router";
+import { Outlet, useLoaderData, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
-import {
-  AppProvider as PolarisAppProvider,
-  Page,
-  Layout,
-  Card,
-  Button,
-  BlockStack,
-  InlineStack,
-  Text,
-  Badge,
-  Divider,
-  Banner,
-} from "@shopify/polaris";
+import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import {
-  resolveBillingMode,
   shopIsGated,
-  findActiveSubscription,
+  resolveSubscription,
+  planSelectionUrl,
+  fetchAppHandle,
+  fetchShopGid,
 } from "../billing.server";
 
 // Import Polaris styles - THIS IS CRITICAL
@@ -29,156 +18,66 @@ import "@shopify/polaris/build/esm/styles.css";
 import enTranslations from "@shopify/polaris/locales/en.json";
 
 export const loader = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, redirect, session } = await authenticate.admin(request);
 
-  // --- Billing gate (code-managed billing) --------------------------------
-  // All the env-var logic lives in app/billing.server.js so the gate, the
-  // subscribe action and the plan page can't drift apart. Shops that installed
-  // before enforcement was switched on are grandfathered and never gated.
-  const { isTest } = resolveBillingMode(session.shop);
+  // --- Billing gate (Shopify App Pricing) ---------------------------------
+  // Shops that installed before enforcement was switched on are grandfathered
+  // and never gated. A gated shop with no subscription is sent to Shopify's
+  // hosted plan selection page — the app no longer renders pricing itself.
   const gated = await shopIsGated(session.shop);
 
-  let needsSubscription = false;
   if (gated) {
-    // Check active subscriptions via the admin GraphQL client (same auth path as
-    // the subscribe action — avoids the offline-token 401 seen with billing.*).
-    // We do NOT redirect here; if there's no active subscription we render our
-    // own in-app pricing page and only send the merchant to Shopify on click.
-    const resp = await admin.graphql(
-      `#graphql
-        query ActiveSubs {
-          currentAppInstallation {
-            activeSubscriptions { id name status test }
-          }
-        }`
-    );
-    const subs =
-      (await resp.json())?.data?.currentAppInstallation?.activeSubscriptions || [];
-    needsSubscription = !findActiveSubscription(subs, isTest);
-    console.log(
-      "[billing][debug] shop=%s gated isTest=%s subs=%s",
-      session.shop,
-      isTest,
-      JSON.stringify(subs)
-    );
-  } else {
-    console.log("[billing][debug] shop=%s NOT gated", session.shop);
+    const shopGid = await fetchShopGid(admin);
+    const subscription = await resolveSubscription(admin, shopGid);
+
+    // resolveSubscription returns `unavailable` when the Partner API could not
+    // be reached. Do NOT redirect on that — a throttled request would bounce a
+    // paying merchant to the plan picker. Let them through and re-check on the
+    // next page load instead.
+    if (subscription?.unavailable) {
+      console.error(
+        "[billing] subscription state unavailable for %s — allowing through",
+        session.shop
+      );
+    } else if (!subscription) {
+      const appHandle = await fetchAppHandle(admin);
+      if (appHandle) {
+        // target: "_top" is required — the plan page lives outside this app's
+        // iframe, so an in-frame redirect would be blocked.
+        return redirect(planSelectionUrl(session.shop, appHandle), {
+          target: "_top",
+        });
+      }
+      console.error(
+        "[billing] no app handle for %s — cannot reach the plan page",
+        session.shop
+      );
+    }
   }
   // ------------------------------------------------------------------------
 
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "", needsSubscription };
+  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 };
 
-const PLAN_FEATURES = [
-  "AI Alt Text Suggestions",
-  "Product Image Optimization",
-  "Page Speed Impact Analysis",
-  "Performance Score",
-  "Core Web Vitals",
-];
-
-function PricingScreen() {
-  const fetcher = useFetcher();
-  const confirmationUrl = fetcher.data?.confirmationUrl;
-  const error = fetcher.data?.error;
-  // Keep the button busy once we have a URL too (we're about to redirect away).
-  const subscribing = fetcher.state !== "idle" || Boolean(confirmationUrl);
-
-  useEffect(() => {
-    if (!confirmationUrl) return;
-    // App Bridge intercepts a top-targeted anchor and redirects the TOP frame
-    // (out of the embedded iframe) to Shopify's approval page.
-    const a = document.createElement("a");
-    a.href = confirmationUrl;
-    a.target = "_top";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  }, [confirmationUrl]);
-
-  return (
-    <Page title="Choose your plan">
-      <Layout>
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="500">
-              <BlockStack gap="200">
-                <InlineStack gap="200" blockAlign="center">
-                  <Text variant="headingLg" as="h2">Basic</Text>
-                  <Badge tone="info">3-day free trial</Badge>
-                </InlineStack>
-                <InlineStack gap="100" blockAlign="baseline">
-                  <Text variant="heading2xl" as="p">$30</Text>
-                  <Text variant="bodyMd" as="span" tone="subdued">/ month</Text>
-                </InlineStack>
-                <Text variant="bodyMd" as="p" tone="subdued">
-                  Unlock the full Image Optimizer &amp; SEO suite. Start with a
-                  3-day free trial — cancel anytime.
-                </Text>
-              </BlockStack>
-
-              <Divider />
-
-              <BlockStack gap="300">
-                {PLAN_FEATURES.map((feature) => (
-                  <InlineStack key={feature} gap="200" blockAlign="center">
-                    <Text as="span" tone="success" variant="bodyMd" fontWeight="bold">✓</Text>
-                    <Text as="span" variant="bodyMd">{feature}</Text>
-                  </InlineStack>
-                ))}
-              </BlockStack>
-
-              <Divider />
-
-              {error ? <Banner tone="critical">{error}</Banner> : null}
-
-              <Button
-                variant="primary"
-                size="large"
-                loading={subscribing}
-                disabled={subscribing}
-                onClick={() =>
-                  fetcher.submit({}, { method: "post", action: "/app/subscribe" })
-                }
-              >
-                Start 3-day free trial
-              </Button>
-              <Text variant="bodySm" as="p" tone="subdued">
-                You&apos;ll be taken to Shopify to approve the subscription.
-              </Text>
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-      </Layout>
-    </Page>
-  );
-}
-
 export default function App() {
-  const { apiKey, needsSubscription } = useLoaderData();
+  const { apiKey } = useLoaderData();
 
+  // No pricing branch here any more: an unsubscribed gated shop never reaches
+  // this component, because the loader redirects it to Shopify's hosted plan
+  // selection page.
   return (
     <ShopifyAppProvider embedded apiKey={apiKey}>
       <PolarisAppProvider i18n={enTranslations}>
-        {needsSubscription ? (
-          // Unsubscribed: show the in-app pricing page instead of the app. The
-          // nav menu is hidden so the merchant can't reach gated pages until
-          // they subscribe.
-          <PricingScreen />
-        ) : (
-          <>
-            <ui-nav-menu>
-              <a href="/app" rel="home">Home</a>
-              <a href="/app/alttextsuggestions">Alt Text Suggestions</a>
-              {/* <a href="/app/imageoptimizationdashboard">Image Optimization Dashboard</a> */}
-              <a href="/app/productoptimization">Image Optimization Dashboard</a>
-              <a href="/app/pagespeedimpactreports">Page Speed Reports</a>
-              <a href="/app/plan">Plan</a>
-            </ui-nav-menu>
-            <Outlet />
-          </>
-        )}
+        <ui-nav-menu>
+          <a href="/app" rel="home">Home</a>
+          <a href="/app/alttextsuggestions">Alt Text Suggestions</a>
+          {/* <a href="/app/imageoptimizationdashboard">Image Optimization Dashboard</a> */}
+          <a href="/app/productoptimization">Image Optimization Dashboard</a>
+          <a href="/app/pagespeedimpactreports">Page Speed Reports</a>
+          <a href="/app/plan">Plan</a>
+        </ui-nav-menu>
+        <Outlet />
       </PolarisAppProvider>
     </ShopifyAppProvider>
   );

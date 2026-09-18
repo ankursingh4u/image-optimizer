@@ -2,6 +2,13 @@ import { useState, useCallback, useEffect } from 'react';
 import { useLoaderData, useSubmit, useNavigation, useActionData } from 'react-router';
 import { authenticate } from '../shopify.server';
 import {
+  quotaContext,
+  checkQuota,
+  recordUsage,
+  quotaMessage,
+  METRICS,
+} from '../usage.server';
+import {
   Page,
   Layout,
   Card,
@@ -388,21 +395,34 @@ export async function action({ request }) {
 
   if (actionType === 'runLighthouseAnalysis') {
     const pageUrl = formData.get('pageUrl');
-    
+
+    const quota = await quotaContext(admin, session);
+    const check = await checkQuota(quota, METRICS.PAGESPEED_REPORTS, 1);
+    if (!check.allowed) {
+      return {
+        success: false,
+        error: quotaMessage(METRICS.PAGESPEED_REPORTS, check),
+      };
+    }
+
     try {
       console.log('Running PageSpeed analysis for:', pageUrl);
       const result = await runPageSpeedTest(pageUrl);
-      
+
       if (!result) {
         throw new Error('Failed to run PageSpeed test');
       }
 
       console.log('PageSpeed result:', result);
 
-      return { 
-        success: true, 
+      // Recorded only on success — a failed or rate-limited PSI call doesn't
+      // consume Google quota, so it shouldn't consume the merchant's either.
+      await recordUsage(session.shop, METRICS.PAGESPEED_REPORTS, 1);
+
+      return {
+        success: true,
         message: `PageSpeed analysis completed. Performance Score: ${result.score}/100`,
-        result 
+        result
       };
     } catch (error) {
       console.error('Error running PageSpeed analysis:', error);
