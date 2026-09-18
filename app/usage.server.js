@@ -1,5 +1,9 @@
 import prisma from "./db.server";
-import { resolveSubscription, isGrandfathered } from "./billing.server";
+import {
+  resolveSubscription,
+  isGrandfathered,
+  resolveBillingMode,
+} from "./billing.server";
 import { PLANS } from "./plans";
 
 /**
@@ -120,10 +124,19 @@ export function currentPeriod(now = new Date()) {
  * One call, so routes don't each re-derive the shop's plan.
  */
 export async function quotaContext(admin, session) {
-  const [subscription, grandfathered] = await Promise.all([
+  const { isTestShop } = resolveBillingMode(session.shop);
+
+  const [subscription, hasGrandfatherRow] = await Promise.all([
     resolveSubscription(admin, null),
     isGrandfathered(session.shop),
   ]);
+
+  // A shop listed in BILLING_TEST_SHOPS exists to exercise the PAID path, and
+  // the backfill grandfathered every shop that had a session when it ran —
+  // which includes our own development store. Without this override that row
+  // wins, the store resolves to `unlimited`, and the quotas are untestable.
+  // shopIsGated already applies the same override to gating.
+  const grandfathered = isTestShop ? false : hasGrandfatherRow;
 
   // `unavailable` means we couldn't read billing state. Treat it as "no
   // subscription" for quota purposes only — the gate in app.jsx has already
