@@ -2,14 +2,18 @@ import "@shopify/shopify-app-react-router/adapters/node";
 import {
   ApiVersion,
   AppDistribution,
-  BillingInterval,
   shopifyApp,
 } from "@shopify/shopify-app-react-router/server";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import prisma from "./db.server";
 
-// Code-managed billing plan. Mirrors the "basic" plan ($30/mo, 3-day trial).
-export const BASIC_PLAN = "Basic";
+// NOTE: no `billing` config here on purpose. The app uses Shopify App Pricing,
+// where plans live in the Partner Dashboard and Shopify creates the
+// subscription itself. Declaring plans in code would be dead configuration at
+// best, and at worst would tempt a future caller into billing.request(), which
+// creates a competing Billing API charge alongside the App Pricing contract.
+// Plan display metadata lives in app/plans.js; subscription state is read
+// through app/partner-api.server.js.
 
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,
@@ -20,18 +24,6 @@ const shopify = shopifyApp({
   authPathPrefix: "/auth",
   sessionStorage: new PrismaSessionStorage(prisma),
   distribution: AppDistribution.AppStore,
-  billing: {
-    [BASIC_PLAN]: {
-      lineItems: [
-        {
-          amount: 30,
-          currencyCode: "USD",
-          interval: BillingInterval.Every30Days,
-        },
-      ],
-      trialDays: 3,
-    },
-  },
   future: {
     expiringOfflineAccessTokens: true,
   },

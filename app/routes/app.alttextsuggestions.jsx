@@ -1,7 +1,14 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useLoaderData, useSubmit, useNavigation, useActionData } from 'react-router';
 import { authenticate } from '../shopify.server';
-import { 
+import {
+  quotaContext,
+  checkQuota,
+  recordUsage,
+  quotaMessage,
+  METRICS,
+} from '../usage.server';
+import {
   Page, 
   Layout, 
   Card, 
@@ -107,7 +114,7 @@ export async function loader({ request }) {
 }
 
 export async function action({ request }) {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const actionType = formData.get('actionType');
 
@@ -209,8 +216,20 @@ export async function action({ request }) {
     try {
       const imagesData = JSON.parse(formData.get('images'));
       const aiProvider = formData.get('aiProvider') || 'openai';
+
+      // Quota check up front: refuse the whole batch rather than generating a
+      // partial one, so the merchant isn't left guessing which images worked.
+      const ctx = await quotaContext(admin, session);
+      const check = await checkQuota(ctx, METRICS.AI_ALT_TEXT, imagesData.length);
+      if (!check.allowed) {
+        return { success: false, error: quotaMessage(METRICS.AI_ALT_TEXT, check) };
+      }
+
       const batchSize = 3;
       const suggestions = [];
+      // Only real AI calls are billable. A generation that falls back to
+      // generateSmartFallback cost us nothing, so it isn't counted.
+      let aiCalls = 0;
 
       for (let i = 0; i < imagesData.length; i += batchSize) {
         const batch = imagesData.slice(i, i + batchSize);
@@ -219,6 +238,7 @@ export async function action({ request }) {
           batch.map(async (image) => {
             try {
               const suggestion = await generateAIAltText(image.url, image.productTitle, aiProvider);
+              aiCalls += 1;
               return { id: image.id, suggestedAlt: suggestion.altText, seoScore: suggestion.seoScore };
             } catch (error) {
               return {
@@ -235,6 +255,8 @@ export async function action({ request }) {
           await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
+
+      await recordUsage(session.shop, METRICS.AI_ALT_TEXT, aiCalls);
 
       return { success: true, suggestions };
     } catch (error) {

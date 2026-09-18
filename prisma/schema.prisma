@@ -26,6 +26,26 @@ model GrandfatheredShop {
   reason          String?
 }
 
+/// Per-shop, per-month tally of the operations that cost us money: AI alt text
+/// generations, image compressions and PageSpeed runs. This is what makes the
+/// plan limits real — without it the tiers differ on price alone and a Starter
+/// shop can spend unbounded OpenAI credit.
+///
+/// `period` is a UTC "YYYY-MM" string rather than a date range: quotas reset on
+/// the calendar month, which is simple to reason about and cheap to query. It
+/// deliberately does NOT track the shop's billing cycle — aligning the two would
+/// mean reading the cycle on every metered call.
+model UsageCounter {
+  shop      String
+  metric    String
+  period    String
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@id([shop, metric, period])
+  @@index([shop, period])
+}
+
 model Session {
   id            String    @id
   shop          String
