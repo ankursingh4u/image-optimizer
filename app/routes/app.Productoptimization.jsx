@@ -670,6 +670,20 @@ export async function action({ request }) {
 
       const optimizationResults = [];
 
+      // This flow also generates AI alt text for images that lack it, which is a
+      // real OpenAI/Anthropic call and must come out of the SAME ai_alt_text
+      // allowance the Alt Text page spends — otherwise a merchant gets unlimited
+      // AI simply by routing it through the optimizer.
+      //
+      // Running out of AI quota does NOT abort the optimization: the image work
+      // is separately metered and already permitted, so we just stop generating
+      // alt text and leave what's on the image.
+      const aiCheck = await checkQuota(quota, METRICS.AI_ALT_TEXT, 1);
+      let aiRemaining = aiCheck.limit === Number.POSITIVE_INFINITY
+        ? Number.POSITIVE_INFINITY
+        : aiCheck.remaining;
+      let aiCalls = 0;
+
       for (const image of images) {
         try {
           const format = getImageFormat(image.url);
@@ -690,10 +704,12 @@ export async function action({ request }) {
             ? Number(prevRec.originalSizeMB)
             : measuredOriginalMB;
 
-          // Generate AI alt text if missing
+          // Generate AI alt text if missing, budget permitting.
           let altText = image.altText;
-          if (!altText || altText.length < 10) {
+          if ((!altText || altText.length < 10) && aiRemaining > 0) {
             altText = await generateAIAltText(image.url, product.title);
+            aiCalls += 1;
+            aiRemaining -= 1;
           }
 
           // Only replace the image if the re-encoded version is at least 2%
@@ -906,8 +922,11 @@ export async function action({ request }) {
 
       // Only images we actually re-encoded and uploaded count against the quota.
       // Ones already at their smallest cost nothing, so charging for them would
-      // penalise a merchant for re-running the optimizer.
+      // penalise a merchant for re-running the optimizer. AI calls are billed
+      // whether or not the image turned out to be worth recompressing, so they
+      // are counted independently of `compressed`.
       await recordUsage(session.shop, METRICS.IMAGES_OPTIMIZED, compressed.length);
+      await recordUsage(session.shop, METRICS.AI_ALT_TEXT, aiCalls);
 
       let message;
       if (compressed.length > 0) {
