@@ -104,6 +104,7 @@ export default function Plan() {
     plans,
     features,
     usage,
+    tier,
   } = useLoaderData();
 
   const price = money(subscription?.amount, subscription?.currency || "USD");
@@ -178,9 +179,16 @@ export default function Plan() {
               <Divider />
 
               <BlockStack gap="300">
-                <Text variant="headingMd" as="h3">
-                  This month&apos;s usage
-                </Text>
+                <InlineStack gap="200" blockAlign="center">
+                  <Text variant="headingMd" as="h3">
+                    This month&apos;s usage
+                  </Text>
+                  {/* Which quota set actually resolved. Without this a
+                      mis-detected tier looks identical to a correct one. */}
+                  <Badge tone={tier === "unlimited" ? "info" : undefined}>
+                    {`${tier} limits`}
+                  </Badge>
+                </InlineStack>
                 {usage.map((u) => (
                   <InlineStack
                     key={u.metric}

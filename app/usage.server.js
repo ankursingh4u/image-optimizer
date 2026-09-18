@@ -1,5 +1,6 @@
 import prisma from "./db.server";
 import { resolveSubscription, isGrandfathered } from "./billing.server";
+import { PLANS } from "./plans";
 
 /**
  * Plan quotas, and the counters that enforce them.
@@ -51,10 +52,26 @@ export const METRIC_LABELS = {
   [METRICS.PAGESPEED_REPORTS]: "PageSpeed reports",
 };
 
-/** Monthly price -> tier. The Admin API reports the contract's price but not
- *  its App Pricing handle, so price is what we can actually discriminate on.
+/** Monthly price -> tier. Only consulted when the plan name doesn't resolve.
  *  Keep in sync with the plans configured in the Partner Dashboard. */
 const TIER_BY_PRICE = { 30: "starter", 99: "growth", 350: "scale" };
+
+/**
+ * Plan name (or handle) -> tier.
+ *
+ * Checked BEFORE price, because price is not a reliable discriminator. Shopify
+ * bills every plan at $0 on a development store, so a dev store on Growth and
+ * one on Scale both report $0; a fully-discounted contract in production looks
+ * the same. The plan's name survives both cases.
+ */
+function tierByName(name) {
+  if (!name) return null;
+  const n = String(name).trim().toLowerCase();
+  const hit = PLANS.find(
+    (p) => p.name.toLowerCase() === n || p.handle.toLowerCase() === n
+  );
+  return hit ? hit.handle : null;
+}
 
 /**
  * Which quota set applies to this shop.
@@ -63,7 +80,7 @@ const TIER_BY_PRICE = { 30: "starter", 99: "growth", 350: "scale" };
  * and were promised continued access, so retroactively metering them would
  * break that. They're a fixed, non-growing set.
  *
- * An active subscription whose price matches no known tier falls back to
+ * A subscription matching no known tier by either name or price falls back to
  * `starter` — the conservative choice, since the alternative is handing out the
  * most expensive tier to anything unrecognised.
  */
@@ -71,15 +88,21 @@ export function tierFor({ subscription, grandfathered }) {
   if (grandfathered) return "unlimited";
   if (!subscription) return "starter";
 
-  const tier = TIER_BY_PRICE[Math.round(Number(subscription.amount))];
-  if (tier) return tier;
+  const byName = tierByName(subscription.handle || subscription.name);
+  if (byName) return byName;
 
-  // A $0 contract is Shopify's no-charge development-store plan. Metering a
-  // test store would make the billing sandbox useless.
+  const byPrice = TIER_BY_PRICE[Math.round(Number(subscription.amount))];
+  if (byPrice) return byPrice;
+
+  // An UNNAMED $0 contract is Shopify's private test plan; metering that would
+  // make the billing sandbox useless. A named plan never reaches here, so a dev
+  // store on Growth still gets Growth's limits — which is what makes the quotas
+  // testable at all.
   if (Number(subscription.amount) === 0) return "unlimited";
 
   console.warn(
-    "[usage] unrecognised subscription price %s — defaulting to starter limits",
+    "[usage] unrecognised plan %j at price %s — defaulting to starter limits",
+    subscription.name,
     subscription.amount
   );
   return "starter";
