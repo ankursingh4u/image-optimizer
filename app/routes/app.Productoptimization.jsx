@@ -24,6 +24,7 @@ import {
   Banner,
   ProgressBar,
   Select,
+  Spinner,
   EmptyState
 } from '@shopify/polaris';
 import sharp from 'sharp';
@@ -1097,8 +1098,32 @@ export default function ProductOptimization() {
   const [successMessage, setSuccessMessage] = useState(null);
   // Which single product is currently being optimized (so only its button spins).
   const [optimizingId, setOptimizingId] = useState(null);
+  // How many products the in-flight bulk run covers, kept separately because the
+  // selection is cleared once the run succeeds.
+  const [bulkCount, setBulkCount] = useState(0);
 
   const isSubmitting = navigation.state === 'submitting';
+
+  // `submitting` covers the optimization request itself; `loading` covers the
+  // reload that follows it. Treating only the first as "busy" left the page
+  // looking idle while its data was still stale.
+  const isBusy = navigation.state !== 'idle';
+
+  // What to tell the merchant while the page is busy. Optimization is slow —
+  // downloads, re-encoding and uploads per image — so silence reads as a hang.
+  let busyTitle = 'Working…';
+  let busyDetail = 'Please keep this page open.';
+  if (isSubmitting && bulkCount > 0) {
+    busyTitle = `Optimizing ${bulkCount} product${bulkCount > 1 ? 's' : ''}…`;
+    busyDetail = 'Each product is downloaded, re-compressed and uploaded back to Shopify, one at a time. This can take a few minutes — please keep this page open.';
+  } else if (isSubmitting && optimizingId) {
+    const target = products.find(p => p.id === optimizingId);
+    busyTitle = target ? `Optimizing "${target.title}"…` : 'Optimizing…';
+    busyDetail = 'Downloading each image, re-compressing it and uploading it back to Shopify. Please keep this page open.';
+  } else if (!isSubmitting) {
+    busyTitle = 'Refreshing your products…';
+    busyDetail = 'Fetching the updated sizes and savings from Shopify.';
+  }
 
   // Keep local products in sync when the loader revalidates (e.g. after an
   // optimization reload).
@@ -1126,12 +1151,17 @@ export default function ProductOptimization() {
       setSuccessMessage(actionData.message);
       setTimeout(() => setSuccessMessage(null), 5000);
       setOptimizingId(null);
+      setBulkCount(0);
+      // Only now is the work done — clearing the selection at click time made
+      // the "Optimize Selected" button disappear the instant it was pressed.
+      setSelectedProducts([]);
 
       // Reload full product data to reflect the optimization (client re-filters).
       submit({}, { method: 'get' });
     } else if (actionData?.error) {
       setError(actionData.error);
       setOptimizingId(null);
+      setBulkCount(0);
     }
   }, [actionData, submit]);
 
@@ -1165,11 +1195,13 @@ export default function ProductOptimization() {
   }, [submit]);
 
   const handleOptimizeSelected = useCallback(() => {
+    if (selectedProducts.length === 0) return;
+    setBulkCount(selectedProducts.length);
     const formData = new FormData();
     formData.append('actionType', 'optimizeBulk');
     formData.append('productIds', JSON.stringify(selectedProducts));
     submit(formData, { method: 'post' });
-    setSelectedProducts([]);
+    // Selection is cleared when the run finishes, not here — see the effect above.
   }, [selectedProducts, submit]);
 
   const getScoreBadge = (score) => {
@@ -1207,6 +1239,20 @@ export default function ProductOptimization() {
       subtitle="Optimize product images with real compression and automatic replacement"
     >
       <Layout>
+        {isBusy && (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="200">
+                <InlineStack gap="300" blockAlign="center">
+                  <Spinner accessibilityLabel="Optimization in progress" size="small" />
+                  <Text variant="headingMd" as="h3">{busyTitle}</Text>
+                </InlineStack>
+                <Text variant="bodyMd" as="p" tone="subdued">{busyDetail}</Text>
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        )}
+
         {error && (
           <Layout.Section>
             <Banner title="Error" tone="critical" onDismiss={() => setError(null)}>
@@ -1289,8 +1335,8 @@ export default function ProductOptimization() {
                   <Button
                     variant="primary"
                     onClick={handleOptimizeSelected}
-                    loading={isSubmitting}
-                    disabled={isSubmitting}
+                    loading={isBusy}
+                    disabled={isBusy}
                   >
                     Optimize Selected ({selectedProducts.length})
                   </Button>
@@ -1418,7 +1464,7 @@ export default function ProductOptimization() {
                               variant={product.needsOptimization ? "primary" : "secondary"}
                               onClick={() => handleOptimizeProduct(product.id)}
                               loading={optimizingId === product.id}
-                              disabled={isSubmitting}
+                              disabled={isBusy}
                             >
                               {product.optimizedImages > 0 ? 'Re-optimize This Product' : 'Optimize This Product'}
                             </Button>
