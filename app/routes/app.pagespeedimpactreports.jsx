@@ -181,7 +181,13 @@ function calculatePerformanceImprovement(product) {
 }
 
 /**
- * Get baseline performance metrics (estimated typical values for e-commerce)
+ * Assumed "before" metrics for a typical e-commerce page.
+ *
+ * These are FIXED CONSTANTS, not measurements — the same numbers for every page
+ * of every store. Nothing here was measured on the merchant's storefront, and
+ * nothing derived from them may be presented as a measured result. Any UI built
+ * on this must say "projected"/"estimated"; the only real numbers on this page
+ * come from runPageSpeedTest(), which calls Google PageSpeed Insights.
  */
 function getBaselineMetrics() {
   return {
@@ -297,21 +303,21 @@ export async function loader({ request }) {
       const avgScoreIncrease = pageAnalyses.reduce((sum, p) => sum + p.improvement.scoreImprovement, 0) / pageAnalyses.length;
       insights.push({
         id: '2',
-        type: 'success',
-        title: 'Performance Score Improved',
-        description: `Average Lighthouse performance score increased by ${avgScoreIncrease.toFixed(0)} points (from ${baseline.score} to ${overall.after.score}), moving pages closer to "Good" rating.`,
-        impact: 'high',
-        status: 'completed'
+        type: 'info',
+        title: 'Projected Performance Score Gain',
+        description: `Against a typical e-commerce baseline of ${baseline.score}, this much compression projects to about ${avgScoreIncrease.toFixed(0)} points of Lighthouse improvement. This is a projection from published benchmarks, not a measurement of your storefront — run a live PageSpeed test on a page for its real score.`,
+        impact: 'medium',
+        status: 'pending'
       });
       
       const avgLoadTimeReduction = pageAnalyses.reduce((sum, p) => sum + p.improvement.loadTimeImprovement, 0) / pageAnalyses.length;
       insights.push({
         id: '3',
-        type: 'success',
-        title: 'Faster Page Load Times',
-        description: `Average page load time reduced by ${avgLoadTimeReduction.toFixed(1)}s. Faster load times directly correlate with improved conversion rates and better user experience.`,
-        impact: 'high',
-        status: 'completed'
+        type: 'info',
+        title: 'Projected Faster Page Load Times',
+        description: `The payload you removed projects to roughly ${avgLoadTimeReduction.toFixed(1)}s less load time per page on a typical mobile connection. Faster load times correlate with better conversion, but this figure is an estimate from the bytes saved rather than a measurement.`,
+        impact: 'medium',
+        status: 'pending'
       });
     }
 
@@ -426,9 +432,9 @@ export async function action({ request }) {
       };
     } catch (error) {
       console.error('Error running PageSpeed analysis:', error);
-      return { 
-        success: false, 
-        error: 'Failed to run PageSpeed analysis. This could be due to API rate limits or the page being inaccessible. Please try again in a few minutes.' 
+      return {
+        success: false,
+        error: "Couldn't run the PageSpeed test. Google has to be able to load the page publicly, so this fails if your storefront is password-protected or the product isn't published to the Online Store. It can also be a rate limit — Google allows roughly 1-2 requests a minute. Check the page opens in a private browser window, then try again in a few minutes.",
       };
     }
   }
@@ -458,12 +464,21 @@ export default function PageSpeedImpactReports() {
   const [showSuccessBanner, setShowSuccessBanner] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
 
+  // A live run measures ONE page as it is right now. Track which page it belongs
+  // to so changing the selector can't display one page's real measurement under
+  // another page's name.
+  const [liveResult, setLiveResult] = useState(null);
+  const [liveResultPage, setLiveResultPage] = useState(null);
+
   const isRunningAnalysis = navigation.state === 'submitting';
 
   useEffect(() => {
     if (actionData?.success) {
       setShowSuccessBanner(true);
       setSuccessMessage(actionData.message);
+      if (actionData.result) {
+        setLiveResult(actionData.result);
+      }
       setTimeout(() => setShowSuccessBanner(false), 5000);
     }
   }, [actionData]);
@@ -477,6 +492,10 @@ export default function PageSpeedImpactReports() {
 
   const handlePageChange = useCallback((value) => {
     setSelectedPage(value);
+    // A measurement belongs to the page it was run against — drop it rather than
+    // let it linger over a different page's numbers.
+    setLiveResult(null);
+    setLiveResultPage(null);
     submit({ page: value }, { method: 'get' });
   }, [submit]);
 
@@ -487,6 +506,11 @@ export default function PageSpeedImpactReports() {
 
     const currentPage = pages.find(p => p.id === selectedPage);
     if (!currentPage) return;
+
+    // Stamp the target before submitting, so the result that comes back is
+    // attributed to the page that was actually tested.
+    setLiveResult(null);
+    setLiveResultPage(selectedPage);
 
     const formData = new FormData();
     formData.append('actionType', 'runLighthouseAnalysis');
@@ -512,6 +536,9 @@ export default function PageSpeedImpactReports() {
   };
 
   const currentData = selectedPage === 'all' ? overall : pages.find(p => p.id === selectedPage) || overall;
+
+  // Only show a measurement against the page it was taken on.
+  const showLive = Boolean(liveResult) && liveResultPage === selectedPage;
 
   const pageOptions = [
     { label: 'All Pages (Average)', value: 'all' },
@@ -563,17 +590,17 @@ export default function PageSpeedImpactReports() {
   return (
     <Page
       title="Page Speed Impact Analysis"
-      subtitle="Real-time performance metrics based on actual image optimization results"
-      // primaryAction={
-      //   selectedPage !== 'all' && pages.length > 0
-      //     ? {
-      //         content: isRunningAnalysis ? 'Running Analysis...' : 'Run Live PageSpeed Test',
-      //         onAction: handleRunLighthouse,
-      //         loading: isRunningAnalysis,
-      //         disabled: isRunningAnalysis
-      //       }
-      //     : undefined
-      // }
+      subtitle="Projected impact of your image optimization, plus live measurement from Google PageSpeed Insights"
+      primaryAction={
+        selectedPage !== 'all' && pages.length > 0
+          ? {
+              content: isRunningAnalysis ? 'Running Analysis...' : 'Run Live PageSpeed Test',
+              onAction: handleRunLighthouse,
+              loading: isRunningAnalysis,
+              disabled: isRunningAnalysis
+            }
+          : undefined
+      }
     >
       <Layout>
         {loadError && (
@@ -609,7 +636,13 @@ export default function PageSpeedImpactReports() {
               </Text>
               <Text variant="bodyMd" as="p">
                 Total savings: <strong>{totalImagesSaved.toFixed(1)} MB</strong> across <strong>{totalImagesOptimized}</strong> images.
-                Performance metrics are calculated based on actual compression data and industry benchmarks.
+                These savings are measured from your store.
+              </Text>
+              <Text variant="bodyMd" as="p">
+                The speed scores below are <strong>projections</strong> — they apply published
+                industry benchmarks to your compression data against a typical e-commerce
+                baseline, and are not measured on your storefront. For real numbers, pick a
+                page and use <strong>Run Live PageSpeed Test</strong>.
               </Text>
             </BlockStack>
           </Banner>
@@ -641,13 +674,59 @@ export default function PageSpeedImpactReports() {
           </Card>
         </Layout.Section>
 
+        {/* Measured result — real Google data, above the projections on purpose */}
+        {showLive && (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="400">
+                <InlineStack align="space-between" blockAlign="center" wrap={true}>
+                  <Text variant="headingMd" as="h3">Measured Performance</Text>
+                  <Badge tone="success">Live from Google PageSpeed Insights</Badge>
+                </InlineStack>
+                <Text variant="bodySm" as="p" tone="subdued">
+                  Measured on this page as it is right now. These are real numbers, not projections.
+                </Text>
+                <InlineStack gap="600" wrap={true} blockAlign="start">
+                  <BlockStack gap="100" inlineAlign="center">
+                    <Text variant="bodySm" as="p" tone="subdued">Performance score</Text>
+                    <Text variant="heading3xl" as="p" tone={getScoreTone(liveResult.score)}>
+                      {liveResult.score}
+                    </Text>
+                    <Text variant="bodySm" as="p" tone="subdued">{getScoreLabel(liveResult.score)}</Text>
+                  </BlockStack>
+                  {metrics.map(metric => (
+                    <BlockStack key={`live-${metric.id}`} gap="100" inlineAlign="center">
+                      <Text variant="bodySm" as="p" tone="subdued">{metric.name}</Text>
+                      <Text variant="headingLg" as="p">
+                        {liveResult[metric.id]}{metric.unit}
+                      </Text>
+                      <Text
+                        variant="bodySm"
+                        as="p"
+                        tone={liveResult[metric.id] <= metric.goodThreshold ? 'success' : 'subdued'}
+                      >
+                        {liveResult[metric.id] <= metric.goodThreshold ? 'Good' : 'Needs work'}
+                      </Text>
+                    </BlockStack>
+                  ))}
+                </InlineStack>
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        )}
+
         {/* Performance Score */}
         <Layout.Section>
           <InlineStack gap="400" wrap={true}>
             <Box minWidth="300px" width="50%">
               <Card>
                 <BlockStack gap="500">
-                  <Text variant="headingMd" as="h3">Performance Score</Text>
+                  <BlockStack gap="100">
+                    <Text variant="headingMd" as="h3">Projected Performance Score</Text>
+                    <Text variant="bodySm" as="p" tone="subdued">
+                      Estimated from compression data — not measured on your store.
+                    </Text>
+                  </BlockStack>
                   <InlineStack align="center" gap="600">
                     <BlockStack gap="200" inlineAlign="center">
                       <Text variant="bodySm" as="p" tone="subdued">Before</Text>
@@ -685,7 +764,12 @@ export default function PageSpeedImpactReports() {
             <Box minWidth="300px" width="50%">
               <Card>
                 <BlockStack gap="500">
-                  <Text variant="headingMd" as="h3">Core Web Vitals</Text>
+                  <BlockStack gap="100">
+                    <Text variant="headingMd" as="h3">Projected Core Web Vitals</Text>
+                    <Text variant="bodySm" as="p" tone="subdued">
+                      Estimated from compression data — not measured on your store.
+                    </Text>
+                  </BlockStack>
                   <BlockStack gap="400">
                     {metrics.map(metric => {
                       const improvement = calculateImprovement(currentData.before[metric.id], currentData.after[metric.id]);
@@ -744,7 +828,7 @@ export default function PageSpeedImpactReports() {
             <Card>
               <BlockStack gap="400">
                 <InlineStack align="space-between" blockAlign="center">
-                  <Text variant="headingMd" as="h3">Optimized Pages Performance</Text>
+                  <Text variant="headingMd" as="h3">Optimized Pages — Projected Impact</Text>
                   {pages.length > 20 && (
                     <Badge tone="info">Showing first 20 of {pages.length} pages</Badge>
                   )}
@@ -786,12 +870,15 @@ export default function PageSpeedImpactReports() {
               <BlockStack gap="300">
                 <Text variant="headingMd" as="h3">Live Performance Testing</Text>
                 <Text variant="bodyMd" as="p">
-                  Select a specific page above and click "Run Live PageSpeed Test" to get real-time performance metrics
-                  from Google PageSpeed Insights. This will show actual measured performance data for the selected page.
+                  Select a specific page above and click "Run Live PageSpeed Test" to measure it with
+                  Google PageSpeed Insights. That result is real measured data for that page, and appears
+                  above the projections. The test isn't available for "All Pages (Average)" — Google
+                  measures one URL at a time.
                 </Text>
                 <Text variant="bodySm" as="p" tone="subdued">
-                  Note: Live testing uses Google's PageSpeed Insights API and may take 30-60 seconds to complete.
-                  Rate limits apply (typically 1-2 requests per minute).
+                  A test takes 30-60 seconds and counts against your plan's monthly PageSpeed reports.
+                  Google must be able to reach the page publicly, so a password-protected storefront or an
+                  unpublished product will fail. Rate limits apply (roughly 1-2 requests per minute).
                 </Text>
               </BlockStack>
             </Card>
