@@ -92,7 +92,11 @@ async function runPageSpeedTest(url) {
     
     const response = await fetch(apiUrl);
     if (!response.ok) {
-      throw new Error('PageSpeed API request failed');
+      // Include Google's own status and reason. The previous bare message hid
+      // WHY every call failed, which let a malformed storefront URL look
+      // identical to a rate limit in the logs.
+      const body = await response.text().catch(() => '');
+      throw new Error(`PageSpeed API ${response.status} for ${url}: ${body.slice(0, 300)}`);
     }
 
     const data = await response.json();
@@ -181,6 +185,35 @@ function calculatePerformanceImprovement(product) {
 }
 
 /**
+ * The storefront origin Google should test.
+ *
+ * Prefer the shop's primary domain: a merchant on a custom domain serves
+ * customers from there, often through a different redirect chain than the
+ * .myshopify.com address, so testing the myshopify one can measure a page no
+ * customer actually loads. Falls back to the shop domain itself, which is
+ * always a real host — never to a reconstructed string.
+ */
+async function getStorefrontOrigin(admin, shop) {
+  try {
+    const response = await admin.graphql(
+      `#graphql
+        query ShopPrimaryDomain {
+          shop {
+            primaryDomain { url }
+          }
+        }
+      `
+    );
+    const data = await response.json();
+    const url = data?.data?.shop?.primaryDomain?.url;
+    if (url) return url.replace(/\/$/, '');
+  } catch (error) {
+    console.error('Could not read primary domain, falling back to shop domain:', error?.message);
+  }
+  return `https://${shop}`;
+}
+
+/**
  * Assumed "before" metrics for a typical e-commerce page.
  *
  * These are FIXED CONSTANTS, not measurements — the same numbers for every page
@@ -209,9 +242,12 @@ export async function loader({ request }) {
   try {
     const products = await getAllProductHandles(admin);
     
-    // Get shop domain
+    // Get shop domain. NOTE: this used to be built by stripping ".myshopify.com"
+    // off the shop domain, which produced "https://optimizer-testing" — not a
+    // resolvable host, so every live PageSpeed test on an unpublished product
+    // failed with a generic API error.
     const shop = session.shop;
-    const shopUrl = `https://${shop.replace('.myshopify.com', '')}`;
+    const shopUrl = await getStorefrontOrigin(admin, shop);
 
     // Analyze pages based on optimized products
     const pageAnalyses = [];
@@ -226,6 +262,10 @@ export async function loader({ request }) {
           id: product.handle,
           url: `/products/${product.handle}`,
           fullUrl: product.onlineStoreUrl || `${shopUrl}/products/${product.handle}`,
+          // onlineStoreUrl is null when the product isn't published to the
+          // Online Store channel. Google can't load such a page, so a live test
+          // is guaranteed to fail — better to say so than to spend the attempt.
+          published: Boolean(product.onlineStoreUrl),
           name: product.title,
           productId: product.id,
           improvement,
@@ -274,6 +314,7 @@ export async function loader({ request }) {
       url: page.url,
       name: page.name,
       fullUrl: page.fullUrl,
+      published: page.published,
       before: page.before,
       after: page.after,
       imagesOptimized: page.improvement.optimizedImages,
@@ -505,7 +546,7 @@ export default function PageSpeedImpactReports() {
     }
 
     const currentPage = pages.find(p => p.id === selectedPage);
-    if (!currentPage) return;
+    if (!currentPage || !currentPage.published) return;
 
     // Stamp the target before submitting, so the result that comes back is
     // attributed to the page that was actually tested.
@@ -539,6 +580,10 @@ export default function PageSpeedImpactReports() {
 
   // Only show a measurement against the page it was taken on.
   const showLive = Boolean(liveResult) && liveResultPage === selectedPage;
+
+  const currentPageMeta = selectedPage === 'all' ? null : pages.find(p => p.id === selectedPage);
+  // Google can only load a page that's actually published to the Online Store.
+  const canRunLive = Boolean(currentPageMeta?.published);
 
   const pageOptions = [
     { label: 'All Pages (Average)', value: 'all' },
@@ -597,7 +642,10 @@ export default function PageSpeedImpactReports() {
               content: isRunningAnalysis ? 'Running Analysis...' : 'Run Live PageSpeed Test',
               onAction: handleRunLighthouse,
               loading: isRunningAnalysis,
-              disabled: isRunningAnalysis
+              // Disabled rather than hidden when the product isn't published —
+              // the banner below explains why, which beats a button that
+              // silently burns one of the plan's monthly reports on a 404.
+              disabled: isRunningAnalysis || !canRunLive
             }
           : undefined
       }
@@ -673,6 +721,19 @@ export default function PageSpeedImpactReports() {
             </InlineStack>
           </Card>
         </Layout.Section>
+
+        {currentPageMeta && !canRunLive && (
+          <Layout.Section>
+            <Banner title="Live testing isn't available for this page" tone="warning">
+              <Text variant="bodyMd" as="p">
+                "{currentPageMeta.name}" isn't published to the Online Store sales channel, so Google
+                can't load it and a live PageSpeed test would fail. Publish the product, or pick a page
+                that's live on your storefront. The projections below still apply — they're based on the
+                images you've already optimized.
+              </Text>
+            </Banner>
+          </Layout.Section>
+        )}
 
         {/* Measured result — real Google data, above the projections on purpose */}
         {showLive && (
