@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
-import { useLoaderData, useSubmit, useNavigation, useActionData } from 'react-router';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useLoaderData, useFetcher, useRevalidator } from 'react-router';
 import { authenticate } from '../shopify.server';
 import {
   quotaContext,
@@ -615,6 +615,9 @@ async function optimizeOneProduct({ admin, session, productId, quota }) {
   if (!headroom.allowed) {
     return {
       success: false,
+      // Flagged so a multi-product run can stop here instead of asking for
+      // every remaining product and collecting the same refusal each time.
+      quotaExhausted: true,
       error: quotaMessage(METRICS.IMAGES_OPTIMIZED, headroom),
     };
   }
@@ -1086,9 +1089,8 @@ async function generateAIAltText(imageUrl, productTitle) {
 
 export default function ProductOptimization() {
   const { products: initialProducts, filter: initialFilter, sortBy: initialSortBy, stats, error: loadError } = useLoaderData();
-  const actionData = useActionData();
-  const submit = useSubmit();
-  const navigation = useNavigation();
+  const fetcher = useFetcher();
+  const revalidator = useRevalidator();
 
   const [products, setProducts] = useState(initialProducts);
   const [filter, setFilter] = useState(initialFilter);
@@ -1096,34 +1098,38 @@ export default function ProductOptimization() {
   const [selectedProducts, setSelectedProducts] = useState([]);
   const [error, setError] = useState(loadError);
   const [successMessage, setSuccessMessage] = useState(null);
-  // Which single product is currently being optimized (so only its button spins).
-  const [optimizingId, setOptimizingId] = useState(null);
-  // How many products the in-flight bulk run covers, kept separately because the
-  // selection is cleared once the run succeeds.
-  const [bulkCount, setBulkCount] = useState(0);
 
-  const isSubmitting = navigation.state === 'submitting';
+  /**
+   * An optimization run, driven one product per request from the browser.
+   *
+   * The server used to take the whole selection in a single request and stay
+   * silent until every product was done, so the page could only show a spinner
+   * — there was no honest number to put in a progress bar. Asking for one
+   * product at a time means each response IS a progress event: real counts,
+   * real per-product results, and no request long enough to hit a proxy
+   * timeout on a big selection.
+   *
+   * { ids: string[], index: number, results: [] }
+   */
+  const [run, setRun] = useState(null);
+  // Which index we've already handed to the server, so the effect below can
+  // tell "not submitted yet" apart from "finished, result is waiting".
+  const submittedIndex = useRef(-1);
+  // fetcher.data still holds the PREVIOUS product's response during the gap
+  // between submitting the next one and that request going in flight. Without
+  // remembering which response we've already banked, that stale object gets
+  // recorded a second time against the wrong product.
+  const consumedData = useRef(null);
 
-  // `submitting` covers the optimization request itself; `loading` covers the
-  // reload that follows it. Treating only the first as "busy" left the page
-  // looking idle while its data was still stale.
-  const isBusy = navigation.state !== 'idle';
+  const isRunning = run !== null;
+  const isBusy = isRunning || revalidator.state !== 'idle';
 
-  // What to tell the merchant while the page is busy. Optimization is slow —
-  // downloads, re-encoding and uploads per image — so silence reads as a hang.
-  let busyTitle = 'Working…';
-  let busyDetail = 'Please keep this page open.';
-  if (isSubmitting && bulkCount > 0) {
-    busyTitle = `Optimizing ${bulkCount} product${bulkCount > 1 ? 's' : ''}…`;
-    busyDetail = 'Each product is downloaded, re-compressed and uploaded back to Shopify, one at a time. This can take a few minutes — please keep this page open.';
-  } else if (isSubmitting && optimizingId) {
-    const target = products.find(p => p.id === optimizingId);
-    busyTitle = target ? `Optimizing "${target.title}"…` : 'Optimizing…';
-    busyDetail = 'Downloading each image, re-compressing it and uploading it back to Shopify. Please keep this page open.';
-  } else if (!isSubmitting) {
-    busyTitle = 'Refreshing your products…';
-    busyDetail = 'Fetching the updated sizes and savings from Shopify.';
-  }
+  const activeId = run ? run.ids[run.index] : null;
+  const activeProduct = activeId ? products.find(p => p.id === activeId) : null;
+
+  const completed = run ? run.results.length : 0;
+  const total = run ? run.ids.length : 0;
+  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
 
   // Keep local products in sync when the loader revalidates (e.g. after an
   // optimization reload).
@@ -1146,24 +1152,86 @@ export default function ProductOptimization() {
     return sorted;
   }, [products, filter, sortBy]);
 
-  useEffect(() => {
-    if (actionData?.success) {
-      setSuccessMessage(actionData.message);
-      setTimeout(() => setSuccessMessage(null), 5000);
-      setOptimizingId(null);
-      setBulkCount(0);
-      // Only now is the work done — clearing the selection at click time made
-      // the "Optimize Selected" button disappear the instant it was pressed.
-      setSelectedProducts([]);
+  // Summarise a finished run, then refresh the product data once.
+  const finishRun = useCallback((results, stoppedEarly) => {
+    setRun(null);
+    submittedIndex.current = -1;
+    setSelectedProducts([]);
 
-      // Reload full product data to reflect the optimization (client re-filters).
-      submit({}, { method: 'get' });
-    } else if (actionData?.error) {
-      setError(actionData.error);
-      setOptimizingId(null);
-      setBulkCount(0);
+    const ok = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
+
+    if (ok.length === 0 && failed.length > 0) {
+      setError(failed[0].error || 'Optimization failed.');
+    } else {
+      let summary = ok.length === 1 && ok[0].message
+        ? ok[0].message
+        : `Optimized ${ok.length} of ${results.length} product${results.length > 1 ? 's' : ''}.`;
+      if (failed.length > 0) {
+        summary += ` ${failed.length} could not be processed — ${failed[0].error}`;
+      }
+      if (stoppedEarly) {
+        summary += ' Remaining products were skipped.';
+      }
+      setSuccessMessage(summary);
+      setTimeout(() => setSuccessMessage(null), 8000);
     }
-  }, [actionData, submit]);
+
+    // One refresh at the end rather than after every product — the numbers only
+    // need to be right when the merchant looks at them again.
+    revalidator.revalidate();
+  }, [revalidator]);
+
+  // Drives the queue: submit the current product, record its result, advance.
+  useEffect(() => {
+    if (!run) return;
+    if (fetcher.state !== 'idle') return;
+
+    // The request we sent has come back — record it and move on. The identity
+    // check is what proves this is a NEW response rather than the last one.
+    if (
+      submittedIndex.current === run.index &&
+      fetcher.data &&
+      fetcher.data !== consumedData.current
+    ) {
+      consumedData.current = fetcher.data;
+      const results = [...run.results, { id: run.ids[run.index], ...fetcher.data }];
+      const nextIndex = run.index + 1;
+
+      // No point asking for the rest once the plan's quota is gone; every one
+      // would come back with the same refusal.
+      if (fetcher.data.quotaExhausted) {
+        finishRun(results, nextIndex < run.ids.length);
+        return;
+      }
+      if (nextIndex >= run.ids.length) {
+        finishRun(results, false);
+        return;
+      }
+      setRun({ ...run, index: nextIndex, results });
+      return;
+    }
+
+    // Otherwise this index hasn't been sent yet.
+    if (submittedIndex.current !== run.index) {
+      submittedIndex.current = run.index;
+      const formData = new FormData();
+      formData.append('actionType', 'optimizeProduct');
+      formData.append('productId', run.ids[run.index]);
+      fetcher.submit(formData, { method: 'post' });
+    }
+  }, [run, fetcher, fetcher.state, fetcher.data, finishRun]);
+
+  const startRun = useCallback((ids) => {
+    if (!ids.length) return;
+    setError(null);
+    setSuccessMessage(null);
+    submittedIndex.current = -1;
+    // Whatever the fetcher is still holding belongs to a previous run — mark it
+    // consumed so the first product of this one can't inherit it.
+    consumedData.current = fetcher.data ?? null;
+    setRun({ ids, index: 0, results: [] });
+  }, [fetcher.data]);
 
   // Filter/sort are client-side now — just update local state (no server reload).
   const handleFilterChange = useCallback((value) => {
@@ -1186,23 +1254,17 @@ export default function ProductOptimization() {
     );
   }, [selectedProducts.length, visibleProducts]);
 
+  // One product is just a run of length one, so both paths report progress the
+  // same way and there is only one code path to keep correct.
   const handleOptimizeProduct = useCallback((productId) => {
-    setOptimizingId(productId);
-    const formData = new FormData();
-    formData.append('actionType', 'optimizeProduct');
-    formData.append('productId', productId);
-    submit(formData, { method: 'post' });
-  }, [submit]);
+    startRun([productId]);
+  }, [startRun]);
 
   const handleOptimizeSelected = useCallback(() => {
-    if (selectedProducts.length === 0) return;
-    setBulkCount(selectedProducts.length);
-    const formData = new FormData();
-    formData.append('actionType', 'optimizeBulk');
-    formData.append('productIds', JSON.stringify(selectedProducts));
-    submit(formData, { method: 'post' });
-    // Selection is cleared when the run finishes, not here — see the effect above.
-  }, [selectedProducts, submit]);
+    startRun(selectedProducts);
+    // Selection is cleared when the run finishes, not here — clearing at click
+    // time made the button vanish the instant it was pressed.
+  }, [selectedProducts, startRun]);
 
   const getScoreBadge = (score) => {
     if (score >= 80) return <Badge tone="success">{score}%</Badge>;
@@ -1239,16 +1301,54 @@ export default function ProductOptimization() {
       subtitle="Optimize product images with real compression and automatic replacement"
     >
       <Layout>
-        {isBusy && (
+        {isRunning && (
           <Layout.Section>
             <Card>
-              <BlockStack gap="200">
-                <InlineStack gap="300" blockAlign="center">
-                  <Spinner accessibilityLabel="Optimization in progress" size="small" />
-                  <Text variant="headingMd" as="h3">{busyTitle}</Text>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center" wrap={true}>
+                  <InlineStack gap="300" blockAlign="center">
+                    <Spinner accessibilityLabel="Optimization in progress" size="small" />
+                    <Text variant="headingMd" as="h3">
+                      {total > 1
+                        ? `Optimizing ${completed + 1} of ${total} products…`
+                        : 'Optimizing…'}
+                    </Text>
+                  </InlineStack>
+                  <Text variant="headingMd" as="p" tone="subdued">{progress}%</Text>
                 </InlineStack>
-                <Text variant="bodyMd" as="p" tone="subdued">{busyDetail}</Text>
+
+                <ProgressBar progress={progress} size="small" tone="primary" />
+
+                <Text variant="bodyMd" as="p">
+                  {activeProduct
+                    ? <>Currently: <Text as="span" fontWeight="semibold">{activeProduct.title}</Text></>
+                    : 'Starting…'}
+                </Text>
+
+                {run.results.length > 0 && (
+                  <Text variant="bodySm" as="p" tone="subdued">
+                    {run.results.filter(r => r.success).length} done
+                    {run.results.some(r => !r.success) &&
+                      `, ${run.results.filter(r => !r.success).length} failed`}
+                  </Text>
+                )}
+
+                <Text variant="bodySm" as="p" tone="subdued">
+                  Each image is downloaded, re-compressed and uploaded back to Shopify, so this
+                  takes a while on products with many images. Please keep this page open.
+                </Text>
               </BlockStack>
+            </Card>
+          </Layout.Section>
+        )}
+
+        {!isRunning && revalidator.state !== 'idle' && (
+          <Layout.Section>
+            <Card>
+              <InlineStack gap="300" blockAlign="center">
+                <Spinner accessibilityLabel="Refreshing" size="small" />
+                <Text variant="bodyMd" as="p">Refreshing your products…</Text>
+              </InlineStack>
             </Card>
           </Layout.Section>
         )}
@@ -1463,7 +1563,7 @@ export default function ProductOptimization() {
                             <Button
                               variant={product.needsOptimization ? "primary" : "secondary"}
                               onClick={() => handleOptimizeProduct(product.id)}
-                              loading={optimizingId === product.id}
+                              loading={activeId === product.id}
                               disabled={isBusy}
                             >
                               {product.optimizedImages > 0 ? 'Re-optimize This Product' : 'Optimize This Product'}
