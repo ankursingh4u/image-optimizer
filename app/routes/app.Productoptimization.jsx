@@ -594,238 +594,163 @@ async function uploadAndReplaceImage(admin, productId, oldMediaId, optimizedBuff
   return newMediaId;
 }
 
-export async function action({ request }) {
-  const { admin, session } = await authenticate.admin(request);
-  const formData = await request.formData();
-  const actionType = formData.get('actionType');
+/**
+ * Optimize every image on one product.
+ *
+ * Called directly by both the single-product and bulk branches. Bulk used to
+ * re-enter `action` with a hand-built Request, which silently broke: the new
+ * Request carried the ORIGINAL request's Content-Type, so its freshly built
+ * multipart body was parsed under the outer urlencoded header, `actionType`
+ * came back null, and every product fell through to "Invalid action" while the
+ * bulk branch still reported success. Calling the function is also cheaper —
+ * no re-authentication and no repeat billing lookup per product.
+ */
+async function optimizeOneProduct({ admin, session, productId, quota }) {
+  // How many images this product needs isn't known until we've fetched it, so
+  // we can't reserve the exact amount up front. Requiring one unit of headroom
+  // and recording the true count afterwards stops a shop at its limit from
+  // starting new work, without ever abandoning a product halfway through.
+  const headroom = await checkQuota(quota, METRICS.IMAGES_OPTIMIZED, 1);
+  if (!headroom.allowed) {
+    return {
+      success: false,
+      error: quotaMessage(METRICS.IMAGES_OPTIMIZED, headroom),
+    };
+  }
 
-  if (actionType === 'optimizeProduct') {
-    const productId = formData.get('productId');
+  try {
+    // Fetch product media (MediaImage nodes give us the ids the current
+    // GraphQL create/delete mutations require) plus any existing optimization
+    // metafields so we can carry forward the TRUE original size on re-optimize.
+    const response = await admin.graphql(
+      `#graphql
+        query GetProductMedia($id: ID!) {
+          product(id: $id) {
+            id
+            title
+            media(first: 250) {
+              edges {
+                node {
+                  mediaContentType
+                  ... on MediaImage {
+                    id
+                    alt
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+            }
+            metafields(first: 20, namespace: "image_optimization") {
+              edges { node { key value } }
+            }
+          }
+        }
+      `,
+      { variables: { id: productId } }
+    );
 
-    // How many images this product needs isn't known until we've fetched it, so
-    // we can't reserve the exact amount up front. Requiring one unit of headroom
-    // and recording the true count afterwards stops a shop at its limit from
-    // starting new work, without ever abandoning a product halfway through.
-    // Bulk optimization re-enters this same branch per product, so it inherits
-    // the check without needing one of its own.
-    const quota = await quotaContext(admin, session);
-    const headroom = await checkQuota(quota, METRICS.IMAGES_OPTIMIZED, 1);
-    if (!headroom.allowed) {
-      return {
-        success: false,
-        error: quotaMessage(METRICS.IMAGES_OPTIMIZED, headroom),
-      };
+    const data = await response.json();
+    const product = data.data.product;
+
+    // Map existing per-image records by their key so that when we re-optimize
+    // an already-optimized image we keep the ORIGINAL (pre-optimization) size
+    // instead of measuring the already-compressed one — otherwise re-optimizing
+    // would report ~0 savings.
+    const existingByKey = {};
+    for (const edge of (product.metafields?.edges || [])) {
+      if (!edge.node.key.startsWith('image_')) continue;
+      try { existingByKey[edge.node.key] = JSON.parse(edge.node.value); } catch (e) {}
     }
 
-    try {
-      // Fetch product media (MediaImage nodes give us the ids the current
-      // GraphQL create/delete mutations require) plus any existing optimization
-      // metafields so we can carry forward the TRUE original size on re-optimize.
-      const response = await admin.graphql(
-        `#graphql
-          query GetProductMedia($id: ID!) {
-            product(id: $id) {
-              id
-              title
-              media(first: 250) {
-                edges {
-                  node {
-                    mediaContentType
-                    ... on MediaImage {
-                      id
-                      alt
-                      image {
-                        url
-                      }
+    const images = product.media.edges
+      .map(edge => edge.node)
+      .filter(node => node && node.mediaContentType === 'IMAGE' && node.image && node.image.url)
+      .map(node => ({ id: node.id, url: node.image.url, altText: node.alt || '' }));
+
+    const optimizationResults = [];
+
+    // This flow also generates AI alt text for images that lack it, which is a
+    // real OpenAI/Anthropic call and must come out of the SAME ai_alt_text
+    // allowance the Alt Text page spends — otherwise a merchant gets unlimited
+    // AI simply by routing it through the optimizer.
+    //
+    // Running out of AI quota does NOT abort the optimization: the image work
+    // is separately metered and already permitted, so we just stop generating
+    // alt text and leave what's on the image.
+    const aiCheck = await checkQuota(quota, METRICS.AI_ALT_TEXT, 1);
+    let aiRemaining = aiCheck.limit === Number.POSITIVE_INFINITY
+      ? Number.POSITIVE_INFINITY
+      : aiCheck.remaining;
+    let aiCalls = 0;
+
+    for (const image of images) {
+      try {
+        const format = getImageFormat(image.url);
+
+        // Optimize image with Sharp. This downloads the original once and
+        // returns its size, so we don't fetch the image a second time.
+        const optimizationData = await optimizeImage(image.url, format);
+
+        // Carry forward the TRUE original size. If this image is itself the
+        // output of a previous optimization, its existing record holds the real
+        // pre-optimization size — keep the larger of that and what we just
+        // measured, so re-optimizing an already-small image still reflects the
+        // full saving instead of ~0.
+        const prevRec = existingByKey[`image_${image.id.split('/').pop()}`];
+        const measuredOriginalMB = optimizationData.originalSizeMB;
+        const newOptimizedMB = optimizationData.optimizedSizeMB;
+        const trueOriginalMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
+          ? Number(prevRec.originalSizeMB)
+          : measuredOriginalMB;
+
+        // Generate AI alt text if missing, budget permitting.
+        let altText = image.altText;
+        if ((!altText || altText.length < 10) && aiRemaining > 0) {
+          altText = await generateAIAltText(image.url, product.title);
+          aiCalls += 1;
+          aiRemaining -= 1;
+        }
+
+        // Only replace the image if the re-encoded version is at least 2%
+        // SMALLER than what is on the store now. Many images are already
+        // optimized (small WebP/JPEG) and re-encoding them is larger — replacing
+        // in that case would INFLATE the file and delete the smaller original.
+        const beneficial = newOptimizedMB < measuredOriginalMB * 0.98;
+
+        if (!beneficial) {
+          // Already optimized: keep the current image. Update alt text only if we
+          // generated/changed it, and record the image honestly (0 further
+          // saving, but preserve any real historical saving from trueOriginal).
+          if (altText && altText !== image.altText) {
+            try {
+              await admin.graphql(
+                `#graphql
+                  mutation UpdateAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
+                    productUpdateMedia(productId: $productId, media: $media) {
+                      media { id }
+                      mediaUserErrors { field message }
                     }
                   }
-                }
-              }
-              metafields(first: 20, namespace: "image_optimization") {
-                edges { node { key value } }
-              }
+                `,
+                { variables: { productId, media: [{ id: image.id, alt: altText }] } }
+              );
+            } catch (altErr) {
+              console.error('Alt update failed (non-fatal):', altErr.message);
             }
           }
-        `,
-        { variables: { id: productId } }
-      );
 
-      const data = await response.json();
-      const product = data.data.product;
-
-      // Map existing per-image records by their key so that when we re-optimize
-      // an already-optimized image we keep the ORIGINAL (pre-optimization) size
-      // instead of measuring the already-compressed one — otherwise re-optimizing
-      // would report ~0 savings.
-      const existingByKey = {};
-      for (const edge of (product.metafields?.edges || [])) {
-        if (!edge.node.key.startsWith('image_')) continue;
-        try { existingByKey[edge.node.key] = JSON.parse(edge.node.value); } catch (e) {}
-      }
-
-      const images = product.media.edges
-        .map(edge => edge.node)
-        .filter(node => node && node.mediaContentType === 'IMAGE' && node.image && node.image.url)
-        .map(node => ({ id: node.id, url: node.image.url, altText: node.alt || '' }));
-
-      const optimizationResults = [];
-
-      // This flow also generates AI alt text for images that lack it, which is a
-      // real OpenAI/Anthropic call and must come out of the SAME ai_alt_text
-      // allowance the Alt Text page spends — otherwise a merchant gets unlimited
-      // AI simply by routing it through the optimizer.
-      //
-      // Running out of AI quota does NOT abort the optimization: the image work
-      // is separately metered and already permitted, so we just stop generating
-      // alt text and leave what's on the image.
-      const aiCheck = await checkQuota(quota, METRICS.AI_ALT_TEXT, 1);
-      let aiRemaining = aiCheck.limit === Number.POSITIVE_INFINITY
-        ? Number.POSITIVE_INFINITY
-        : aiCheck.remaining;
-      let aiCalls = 0;
-
-      for (const image of images) {
-        try {
-          const format = getImageFormat(image.url);
-
-          // Optimize image with Sharp. This downloads the original once and
-          // returns its size, so we don't fetch the image a second time.
-          const optimizationData = await optimizeImage(image.url, format);
-
-          // Carry forward the TRUE original size. If this image is itself the
-          // output of a previous optimization, its existing record holds the real
-          // pre-optimization size — keep the larger of that and what we just
-          // measured, so re-optimizing an already-small image still reflects the
-          // full saving instead of ~0.
-          const prevRec = existingByKey[`image_${image.id.split('/').pop()}`];
-          const measuredOriginalMB = optimizationData.originalSizeMB;
-          const newOptimizedMB = optimizationData.optimizedSizeMB;
-          const trueOriginalMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
-            ? Number(prevRec.originalSizeMB)
-            : measuredOriginalMB;
-
-          // Generate AI alt text if missing, budget permitting.
-          let altText = image.altText;
-          if ((!altText || altText.length < 10) && aiRemaining > 0) {
-            altText = await generateAIAltText(image.url, product.title);
-            aiCalls += 1;
-            aiRemaining -= 1;
-          }
-
-          // Only replace the image if the re-encoded version is at least 2%
-          // SMALLER than what is on the store now. Many images are already
-          // optimized (small WebP/JPEG) and re-encoding them is larger — replacing
-          // in that case would INFLATE the file and delete the smaller original.
-          const beneficial = newOptimizedMB < measuredOriginalMB * 0.98;
-
-          if (!beneficial) {
-            // Already optimized: keep the current image. Update alt text only if we
-            // generated/changed it, and record the image honestly (0 further
-            // saving, but preserve any real historical saving from trueOriginal).
-            if (altText && altText !== image.altText) {
-              try {
-                await admin.graphql(
-                  `#graphql
-                    mutation UpdateAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
-                      productUpdateMedia(productId: $productId, media: $media) {
-                        media { id }
-                        mediaUserErrors { field message }
-                      }
-                    }
-                  `,
-                  { variables: { productId, media: [{ id: image.id, alt: altText }] } }
-                );
-              } catch (altErr) {
-                console.error('Alt update failed (non-fatal):', altErr.message);
-              }
-            }
-
-            const imageKey = `image_${image.id.split('/').pop()}`;
-            const compressionRate = trueOriginalMB > 0
-              ? Math.round(((trueOriginalMB - measuredOriginalMB) / trueOriginalMB) * 100)
-              : 0;
-            await admin.graphql(
-              `#graphql
-                mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
-                  metafieldsSet(metafields: $metafields) {
-                    metafields { key value }
-                    userErrors { field message }
-                  }
-                }
-              `,
-              {
-                variables: {
-                  metafields: [
-                    {
-                      ownerId: productId,
-                      namespace: 'image_optimization',
-                      key: imageKey,
-                      value: JSON.stringify({
-                        originalSizeMB: trueOriginalMB,
-                        optimizedSizeMB: measuredOriginalMB,
-                        compressionRate,
-                        format,
-                        altText,
-                        alreadyOptimized: true,
-                        optimizedAt: new Date().toISOString(),
-                        originalImageId: image.id,
-                        newImageId: image.id
-                      }),
-                      type: 'json'
-                    }
-                  ]
-                }
-              }
-            );
-
-            optimizationResults.push({
-              imageId: image.id,
-              originalImageId: image.id,
-              originalSize: trueOriginalMB,
-              optimizedSize: measuredOriginalMB,
-              compressionRate,
-              alreadyOptimized: true,
-              altText,
-              success: true
-            });
-            continue;
-          }
-
+          const imageKey = `image_${image.id.split('/').pop()}`;
           const compressionRate = trueOriginalMB > 0
-            ? Math.round(((trueOriginalMB - newOptimizedMB) / trueOriginalMB) * 100)
-            : optimizationData.compressionRate;
-
-          // Determine output format (optimizeImage outputs WebP for webp/png
-          // sources, otherwise JPEG) so we name/type the upload correctly.
-          const outIsWebp = format === 'webp' || format === 'png';
-          const outMime = outIsWebp ? 'image/webp' : 'image/jpeg';
-          const outFilename = `optimized-${Date.now()}.${outIsWebp ? 'webp' : 'jpg'}`;
-
-          // Upload optimized image (GraphQL) and replace the original
-          const newImageId = await uploadAndReplaceImage(
-            admin,
-            productId,
-            image.id,
-            optimizationData.optimizedBuffer,
-            outFilename,
-            outMime,
-            altText
-          );
-
-          // Save optimization metadata
-          const imageKey = `image_${newImageId.split('/').pop()}`;
+            ? Math.round(((trueOriginalMB - measuredOriginalMB) / trueOriginalMB) * 100)
+            : 0;
           await admin.graphql(
             `#graphql
               mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
                 metafieldsSet(metafields: $metafields) {
-                  metafields {
-                    key
-                    value
-                  }
-                  userErrors {
-                    field
-                    message
-                  }
+                  metafields { key value }
+                  userErrors { field message }
                 }
               }
             `,
@@ -838,13 +763,14 @@ export async function action({ request }) {
                     key: imageKey,
                     value: JSON.stringify({
                       originalSizeMB: trueOriginalMB,
-                      optimizedSizeMB: newOptimizedMB,
-                      compressionRate: compressionRate,
-                      format: format,
-                      altText: altText,
+                      optimizedSizeMB: measuredOriginalMB,
+                      compressionRate,
+                      format,
+                      altText,
+                      alreadyOptimized: true,
                       optimizedAt: new Date().toISOString(),
                       originalImageId: image.id,
-                      newImageId: newImageId
+                      newImageId: image.id
                     }),
                     type: 'json'
                   }
@@ -854,139 +780,237 @@ export async function action({ request }) {
           );
 
           optimizationResults.push({
-            imageId: newImageId,
+            imageId: image.id,
             originalImageId: image.id,
             originalSize: trueOriginalMB,
-            optimizedSize: newOptimizedMB,
-            compressionRate: compressionRate,
+            optimizedSize: measuredOriginalMB,
+            compressionRate,
+            alreadyOptimized: true,
             altText,
             success: true
           });
-
-        } catch (imageError) {
-          console.error(`Error optimizing image ${image.id}:`, imageError);
-          optimizationResults.push({
-            imageId: image.id,
-            success: false,
-            error: imageError.message
-          });
+          continue;
         }
-      }
 
-      // Save product-level optimization summary
-      const successfulOptimizations = optimizationResults.filter(r => r.success);
-      
-      await admin.graphql(
-        `#graphql
-          mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
-            metafieldsSet(metafields: $metafields) {
-              metafields {
-                key
-                value
-              }
-              userErrors {
-                field
-                message
+        const compressionRate = trueOriginalMB > 0
+          ? Math.round(((trueOriginalMB - newOptimizedMB) / trueOriginalMB) * 100)
+          : optimizationData.compressionRate;
+
+        // Determine output format (optimizeImage outputs WebP for webp/png
+        // sources, otherwise JPEG) so we name/type the upload correctly.
+        const outIsWebp = format === 'webp' || format === 'png';
+        const outMime = outIsWebp ? 'image/webp' : 'image/jpeg';
+        const outFilename = `optimized-${Date.now()}.${outIsWebp ? 'webp' : 'jpg'}`;
+
+        // Upload optimized image (GraphQL) and replace the original
+        const newImageId = await uploadAndReplaceImage(
+          admin,
+          productId,
+          image.id,
+          optimizationData.optimizedBuffer,
+          outFilename,
+          outMime,
+          altText
+        );
+
+        // Save optimization metadata
+        const imageKey = `image_${newImageId.split('/').pop()}`;
+        await admin.graphql(
+          `#graphql
+            mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields {
+                  key
+                  value
+                }
+                userErrors {
+                  field
+                  message
+                }
               }
             }
+          `,
+          {
+            variables: {
+              metafields: [
+                {
+                  ownerId: productId,
+                  namespace: 'image_optimization',
+                  key: imageKey,
+                  value: JSON.stringify({
+                    originalSizeMB: trueOriginalMB,
+                    optimizedSizeMB: newOptimizedMB,
+                    compressionRate: compressionRate,
+                    format: format,
+                    altText: altText,
+                    optimizedAt: new Date().toISOString(),
+                    originalImageId: image.id,
+                    newImageId: newImageId
+                  }),
+                  type: 'json'
+                }
+              ]
+            }
           }
-        `,
-        {
-          variables: {
-            metafields: [
-              {
-                ownerId: productId,
-                namespace: 'image_optimization',
-                key: 'optimization_summary',
-                value: JSON.stringify({
-                  totalImages: images.length,
-                  optimizedImages: successfulOptimizations.length,
-                  totalOriginalSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.originalSize, 0),
-                  totalOptimizedSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.optimizedSize, 0),
-                  totalSizeSavedMB: successfulOptimizations.reduce((sum, r) => sum + (r.originalSize - r.optimizedSize), 0),
-                  avgCompressionRate: successfulOptimizations.length > 0 
-                    ? Math.round(successfulOptimizations.reduce((sum, r) => sum + r.compressionRate, 0) / successfulOptimizations.length)
-                    : 0,
-                  lastOptimizedAt: new Date().toISOString()
-                }),
-                type: 'json'
-              }
-            ]
+        );
+
+        optimizationResults.push({
+          imageId: newImageId,
+          originalImageId: image.id,
+          originalSize: trueOriginalMB,
+          optimizedSize: newOptimizedMB,
+          compressionRate: compressionRate,
+          altText,
+          success: true
+        });
+
+      } catch (imageError) {
+        console.error(`Error optimizing image ${image.id}:`, imageError);
+        optimizationResults.push({
+          imageId: image.id,
+          success: false,
+          error: imageError.message
+        });
+      }
+    }
+
+    // Save product-level optimization summary
+    const successfulOptimizations = optimizationResults.filter(r => r.success);
+    
+    await admin.graphql(
+      `#graphql
+        mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields {
+              key
+              value
+            }
+            userErrors {
+              field
+              message
+            }
           }
         }
-      );
-
-      const compressed = successfulOptimizations.filter(r => !r.alreadyOptimized);
-      const skipped = successfulOptimizations.filter(r => r.alreadyOptimized);
-      const totalSaved = compressed.reduce((sum, r) => sum + Math.max(r.originalSize - r.optimizedSize, 0), 0);
-
-      // Only images we actually re-encoded and uploaded count against the quota.
-      // Ones already at their smallest cost nothing, so charging for them would
-      // penalise a merchant for re-running the optimizer. AI calls are billed
-      // whether or not the image turned out to be worth recompressing, so they
-      // are counted independently of `compressed`.
-      await recordUsage(session.shop, METRICS.IMAGES_OPTIMIZED, compressed.length);
-      await recordUsage(session.shop, METRICS.AI_ALT_TEXT, aiCalls);
-
-      let message;
-      if (compressed.length > 0) {
-        message = `Compressed ${compressed.length} image${compressed.length > 1 ? 's' : ''} for "${product.title}" — saved ${totalSaved >= 1 ? totalSaved.toFixed(1) + ' MB' : Math.round(totalSaved * 1024) + ' KB'}.`;
-      } else if (skipped.length > 0) {
-        message = `"${product.title}" is already optimized — its ${skipped.length} image${skipped.length > 1 ? 's are' : ' is'} already as small as possible, so nothing was changed.`;
-      } else {
-        message = `No images could be processed for "${product.title}".`;
+      `,
+      {
+        variables: {
+          metafields: [
+            {
+              ownerId: productId,
+              namespace: 'image_optimization',
+              key: 'optimization_summary',
+              value: JSON.stringify({
+                totalImages: images.length,
+                optimizedImages: successfulOptimizations.length,
+                totalOriginalSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.originalSize, 0),
+                totalOptimizedSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.optimizedSize, 0),
+                totalSizeSavedMB: successfulOptimizations.reduce((sum, r) => sum + (r.originalSize - r.optimizedSize), 0),
+                avgCompressionRate: successfulOptimizations.length > 0 
+                  ? Math.round(successfulOptimizations.reduce((sum, r) => sum + r.compressionRate, 0) / successfulOptimizations.length)
+                  : 0,
+                lastOptimizedAt: new Date().toISOString()
+              }),
+              type: 'json'
+            }
+          ]
+        }
       }
+    );
 
-      return {
-        success: true,
-        message,
-        results: optimizationResults
-      };
+    const compressed = successfulOptimizations.filter(r => !r.alreadyOptimized);
+    const skipped = successfulOptimizations.filter(r => r.alreadyOptimized);
+    const totalSaved = compressed.reduce((sum, r) => sum + Math.max(r.originalSize - r.optimizedSize, 0), 0);
 
-    } catch (error) {
-      console.error('Error optimizing product:', error);
-      return {
-        success: false,
-        error: 'Failed to optimize product: ' + error.message
-      };
+    // Only images we actually re-encoded and uploaded count against the quota.
+    // Ones already at their smallest cost nothing, so charging for them would
+    // penalise a merchant for re-running the optimizer. AI calls are billed
+    // whether or not the image turned out to be worth recompressing, so they
+    // are counted independently of `compressed`.
+    await recordUsage(session.shop, METRICS.IMAGES_OPTIMIZED, compressed.length);
+    await recordUsage(session.shop, METRICS.AI_ALT_TEXT, aiCalls);
+
+    let message;
+    if (compressed.length > 0) {
+      message = `Compressed ${compressed.length} image${compressed.length > 1 ? 's' : ''} for "${product.title}" — saved ${totalSaved >= 1 ? totalSaved.toFixed(1) + ' MB' : Math.round(totalSaved * 1024) + ' KB'}.`;
+    } else if (skipped.length > 0) {
+      message = `"${product.title}" is already optimized — its ${skipped.length} image${skipped.length > 1 ? 's are' : ' is'} already as small as possible, so nothing was changed.`;
+    } else {
+      message = `No images could be processed for "${product.title}".`;
     }
+
+    return {
+      success: true,
+      message,
+      results: optimizationResults
+    };
+
+  } catch (error) {
+    console.error('Error optimizing product:', error);
+    return {
+      success: false,
+      error: 'Failed to optimize product: ' + error.message
+    };
+  }
+}
+
+export async function action({ request }) {
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const actionType = formData.get('actionType');
+
+  if (actionType === 'optimizeProduct') {
+    const productId = formData.get('productId');
+    const quota = await quotaContext(admin, session);
+    return optimizeOneProduct({ admin, session, productId, quota });
   }
 
   if (actionType === 'optimizeBulk') {
-    const productIds = JSON.parse(formData.get('productIds'));
-    
+    let productIds;
     try {
-      const results = [];
-      
-      for (const productId of productIds) {
-        const productFormData = new FormData();
-        productFormData.append('actionType', 'optimizeProduct');
-        productFormData.append('productId', productId);
-        
-        const newRequest = new Request(request.url, { 
-          method: 'POST', 
-          body: productFormData,
-          headers: request.headers
-        });
-        
-        const result = await action({ request: newRequest });
-        results.push(result);
+      productIds = JSON.parse(formData.get('productIds'));
+    } catch (err) {
+      return { success: false, error: 'Could not read the selected products.' };
+    }
+    if (!Array.isArray(productIds) || productIds.length === 0) {
+      return { success: false, error: 'No products were selected.' };
+    }
+
+    // Resolved once: a shop's tier cannot change mid-run, and resolving it per
+    // product would add a Shopify billing round-trip each. The per-product quota
+    // check inside optimizeOneProduct still re-reads the counter, which
+    // recordUsage has already incremented, so a bulk run stops when the plan
+    // runs out instead of sailing past the limit.
+    const quota = await quotaContext(admin, session);
+
+    const results = [];
+    for (const productId of productIds) {
+      try {
+        results.push(await optimizeOneProduct({ admin, session, productId, quota }));
+      } catch (error) {
+        console.error('Bulk optimize failed for %s:', productId, error);
+        results.push({ success: false, error: error.message });
       }
+    }
 
-      const successCount = results.filter(r => r.success).length;
-      
-      return {
-        success: true,
-        message: `Successfully optimized ${successCount} out of ${productIds.length} products`
-      };
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
 
-    } catch (error) {
-      console.error('Error in bulk optimization:', error);
+    // Surface the first real reason rather than a bare count. When a bulk run
+    // stops because the plan quota ran out, that is what the merchant needs to
+    // read — "0 out of 12" on its own explains nothing.
+    if (succeeded.length === 0) {
       return {
         success: false,
-        error: 'Failed to optimize products in bulk'
+        error: failed[0]?.error || 'None of the selected products could be optimized.',
       };
     }
+
+    let message = `Optimized ${succeeded.length} of ${productIds.length} product${productIds.length > 1 ? 's' : ''}.`;
+    if (failed.length > 0) {
+      message += ` ${failed.length} could not be processed — ${failed[0].error}`;
+    }
+
+    return { success: true, message };
   }
 
   return { success: false, error: 'Invalid action' };
