@@ -8,6 +8,7 @@ import {
   quotaMessage,
   METRICS,
 } from '../usage.server';
+import { generateAltText } from '../alttext.server';
 import {
   Page, 
   Layout, 
@@ -289,55 +290,11 @@ async function generateAIAltText(imageUrl, productTitle, provider = 'openai') {
   }
 }
 
+// The generation itself lives in alttext.server.js, shared with the optimizer —
+// which used to call a different provider with a different prompt for the same
+// job. Only the SEO score is this page's concern.
 async function generateWithOpenAI(imageUrl, productTitle) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY not configured');
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      max_tokens: 150,
-      temperature: 0.4,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `Generate SEO-optimized alt text for this e-commerce product image.
-
-Product: ${productTitle}
-
-Requirements:
-- Include specific visual details (color, material, style, pattern)
-- Describe what you actually see in the image
-- Keep it under 125 characters
-- Make it natural and descriptive
-- Don't use "image of" or "picture of"
-- Focus on features that help customers understand the product
-
-Return ONLY the alt text, nothing else.`
-          },
-          { type: 'image_url', image_url: { url: imageUrl } }
-        ]
-      }]
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
-  }
-
-  const result = await response.json();
-  let altText = result.choices[0]?.message?.content?.trim() || '';
-  altText = altText.replace(/^["']|["']$/g, '').replace(/\n/g, ' ').replace(/\s+/g, ' ');
-  if (altText.length > 125) altText = altText.substring(0, 122) + '...';
-
+  const altText = await generateAltText(imageUrl, productTitle);
   return { altText, seoScore: calculateSeoScore(altText) };
 }
 

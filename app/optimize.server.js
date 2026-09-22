@@ -5,6 +5,7 @@ import {
   quotaMessage,
   METRICS,
 } from './usage.server';
+import { generateAltText, altTextAvailable } from './alttext.server';
 
 /**
  * Image optimization, one image at a time.
@@ -232,72 +233,6 @@ async function writeImageRecord(admin, productId, key, record) {
 }
 
 /**
- * Alt text from Claude vision.
- *
- * `prefetched` is the buffer the optimizer already downloaded. Without it this
- * function fetched the full image a SECOND time, which on a large image was
- * often the single slowest thing in the whole per-image path.
- */
-export async function generateAIAltText(imageUrl, productTitle, prefetched = null) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return `${productTitle} - product image`;
-  }
-
-  try {
-    let buffer = prefetched;
-    if (!buffer) {
-      const downloaded = await downloadImage(imageUrl);
-      buffer = downloaded.buffer;
-    }
-    const base64Image = Buffer.from(buffer).toString('base64');
-
-    let mediaType = 'image/jpeg';
-    const lower = String(imageUrl).toLowerCase();
-    if (lower.includes('.png')) mediaType = 'image/png';
-    if (lower.includes('.webp')) mediaType = 'image/webp';
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 150,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: { type: 'base64', media_type: mediaType, data: base64Image },
-              },
-              {
-                type: 'text',
-                text: `Generate SEO-optimized alt text for this ${productTitle} image. Include: product type, color, material, style. Keep under 125 characters. Return only the alt text.`,
-              },
-            ],
-          },
-        ],
-      }),
-    });
-
-    const result = await response.json();
-    let altText = result.content[0].text.trim();
-    altText = altText.replace(/^["']|["']$/g, '').replace(/\n/g, ' ');
-    if (altText.length > 125) {
-      altText = altText.substring(0, 122) + '...';
-    }
-    return altText;
-  } catch (error) {
-    console.error('[optimize] alt text generation failed:', error.message);
-    return `${productTitle} - product image`;
-  }
-}
-
-/**
  * The images currently on a product, in the order the merchant has them.
  *
  * The browser needs this before it can show "image 1 of 8" or decide how much
@@ -434,13 +369,21 @@ export async function optimizeProductImage({
     let altTextWork = Promise.resolve(currentAlt);
     let aiAltTextGenerated = false;
 
-    if (needsAltText && process.env.ANTHROPIC_API_KEY) {
+    if (needsAltText && altTextAvailable()) {
       const aiReserved = await reserveUsage(quota, METRICS.AI_ALT_TEXT, 1);
       if (aiReserved.allowed) {
         aiAltTextGenerated = true;
-        // Reuses the buffer we just downloaded instead of fetching the image
-        // again, and runs alongside the re-encode instead of after it.
-        altTextWork = generateAIAltText(imageUrl, product.title, original.buffer);
+        // Runs alongside the re-encode rather than after it. OpenAI reads the
+        // CDN URL itself, so describing the image costs us no extra download.
+        altTextWork = generateAltText(imageUrl, product.title).catch(async (err) => {
+          console.error('[optimize] alt text failed for %s:', imageId, err.message);
+          // A description we never got must not cost the merchant anything, and
+          // inventing one for an image nobody looked at would be worse than
+          // leaving the existing alt text alone.
+          aiAltTextGenerated = false;
+          await refundUsage(quota.shop, METRICS.AI_ALT_TEXT, 1);
+          return currentAlt;
+        });
       }
       // Running out of AI quota does NOT abort the image: the compression is
       // separately metered and already reserved, so we keep the existing alt.
