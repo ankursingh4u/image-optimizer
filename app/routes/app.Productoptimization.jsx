@@ -1,13 +1,8 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { useLoaderData, useFetcher, useRevalidator } from 'react-router';
+import { useLoaderData, useRevalidator } from 'react-router';
 import { authenticate } from '../shopify.server';
-import {
-  quotaContext,
-  checkQuota,
-  recordUsage,
-  quotaMessage,
-  METRICS,
-} from '../usage.server';
+import { quotaContext } from '../usage.server';
+import { getImageFormat, optimizeWholeProduct } from '../optimize.server';
 import {
   Page,
   Layout,
@@ -27,7 +22,6 @@ import {
   Spinner,
   EmptyState
 } from '@shopify/polaris';
-import sharp from 'sharp';
 
 /**
  * Fetch all products with pagination
@@ -127,41 +121,6 @@ async function getAllProducts(admin) {
   }
 
   return allProducts;
-}
-
-/**
- * Get actual image file size by fetching the image
- */
-async function getActualImageSize(imageUrl) {
-  try {
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error('Failed to fetch image');
-    }
-    
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) {
-      return parseInt(contentLength) / (1024 * 1024); // Convert to MB
-    }
-    
-    // If no content-length, download and measure
-    const buffer = await response.arrayBuffer();
-    return buffer.byteLength / (1024 * 1024); // Convert to MB
-  } catch (error) {
-    console.error('Error getting image size:', error);
-    return 0;
-  }
-}
-
-/**
- * Get image format from URL
- */
-function getImageFormat(url) {
-  const urlLower = url.toLowerCase();
-  if (urlLower.includes('.webp')) return 'webp';
-  if (urlLower.includes('.png')) return 'png';
-  if (urlLower.includes('.gif')) return 'gif';
-  return 'jpg';
 }
 
 /**
@@ -449,647 +408,66 @@ export async function loader({ request }) {
 }
 
 /**
- * Optimize image using Sharp library
- */
-async function optimizeImage(imageUrl, format) {
-  try {
-    // Download original image
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error('Failed to fetch image');
-    }
-    
-    const originalBuffer = await response.arrayBuffer();
-    const originalSizeMB = originalBuffer.byteLength / (1024 * 1024);
-
-    // Optimize image with Sharp
-    let optimizedBuffer;
-    const sharpInstance = sharp(Buffer.from(originalBuffer));
-
-    if (format === 'webp' || format === 'png') {
-      // Convert to WebP for better compression
-      optimizedBuffer = await sharpInstance
-        .resize(2048, 2048, { 
-          fit: 'inside', 
-          withoutEnlargement: true 
-        })
-        .webp({ quality: 85, effort: 4 })
-        .toBuffer();
-    } else {
-      // Optimize JPEG
-      optimizedBuffer = await sharpInstance
-        .resize(2048, 2048, { 
-          fit: 'inside', 
-          withoutEnlargement: true 
-        })
-        .jpeg({ quality: 85, progressive: true })
-        .toBuffer();
-    }
-
-    const optimizedSizeMB = optimizedBuffer.byteLength / (1024 * 1024);
-
-    return {
-      originalSizeMB,
-      optimizedSizeMB,
-      optimizedBuffer,
-      compressionRate: Math.round(((originalSizeMB - optimizedSizeMB) / originalSizeMB) * 100)
-    };
-
-  } catch (error) {
-    console.error('Error optimizing image:', error);
-    throw error;
-  }
-}
-
-/**
- * Upload the optimized image to Shopify via the current GraphQL Admin API and
- * replace the original. Flow: stagedUploadsCreate -> upload bytes to the staged
- * target -> productCreateMedia -> productDeleteMedia (old image).
+ * Whole-product fallback.
  *
- * Returns the new MediaImage gid.
+ * The page itself drives `/api/optimize` one image at a time so it can show
+ * real progress. This single-request path stays for anything that can't do
+ * that — including a browser still running the previous build in the minutes
+ * after a deploy, which would otherwise post here and get "Invalid action".
  */
-async function uploadAndReplaceImage(admin, productId, oldMediaId, optimizedBuffer, filename, mimeType, altText) {
-  // 1. Ask Shopify for a staged upload target (a signed URL to POST the file to).
-  const stagedResp = await admin.graphql(
-    `#graphql
-      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-        stagedUploadsCreate(input: $input) {
-          stagedTargets { url resourceUrl parameters { name value } }
-          userErrors { field message }
-        }
-      }
-    `,
-    {
-      variables: {
-        input: [{ filename, mimeType, resource: 'IMAGE', httpMethod: 'POST' }],
-      },
-    }
-  );
-  const stagedJson = await stagedResp.json();
-  const stagedErrors = stagedJson.data?.stagedUploadsCreate?.userErrors || [];
-  const target = stagedJson.data?.stagedUploadsCreate?.stagedTargets?.[0];
-  if (stagedErrors.length || !target) {
-    throw new Error('stagedUploadsCreate failed: ' + JSON.stringify(stagedErrors));
-  }
-
-  // 2. POST the optimized bytes to the staged target. Order matters: all the
-  //    provided parameters first, then the file last.
-  const form = new FormData();
-  for (const param of target.parameters) {
-    form.append(param.name, param.value);
-  }
-  form.append('file', new Blob([optimizedBuffer], { type: mimeType }), filename);
-
-  const uploadResp = await fetch(target.url, { method: 'POST', body: form });
-  if (!uploadResp.ok) {
-    const text = await uploadResp.text();
-    console.error('Staged upload failed:', uploadResp.status, text.slice(0, 300));
-    throw new Error('Staged upload failed with status ' + uploadResp.status);
-  }
-
-  // 3. Attach the uploaded file to the product as new media.
-  const createResp = await admin.graphql(
-    `#graphql
-      mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
-        productCreateMedia(productId: $productId, media: $media) {
-          media { id ... on MediaImage { id } }
-          mediaUserErrors { field message }
-        }
-      }
-    `,
-    {
-      variables: {
-        productId,
-        media: [{ alt: altText, mediaContentType: 'IMAGE', originalSource: target.resourceUrl }],
-      },
-    }
-  );
-  const createJson = await createResp.json();
-  const createErrors = createJson.data?.productCreateMedia?.mediaUserErrors || [];
-  if (createErrors.length) {
-    throw new Error('productCreateMedia failed: ' + JSON.stringify(createErrors));
-  }
-  const newMediaId = createJson.data?.productCreateMedia?.media?.[0]?.id;
-
-  // 4. Delete the original image now that the optimized copy is attached.
-  if (oldMediaId) {
-    const deleteResp = await admin.graphql(
-      `#graphql
-        mutation productDeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
-          productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
-            deletedMediaIds
-            mediaUserErrors { field message }
-          }
-        }
-      `,
-      { variables: { productId, mediaIds: [oldMediaId] } }
-    );
-    const deleteJson = await deleteResp.json();
-    const deleteErrors = deleteJson.data?.productDeleteMedia?.mediaUserErrors || [];
-    if (deleteErrors.length) {
-      // Non-fatal: the optimized image is already attached; just log.
-      console.error('productDeleteMedia failed:', JSON.stringify(deleteErrors));
-    }
-  }
-
-  return newMediaId;
-}
-
-/**
- * Optimize every image on one product.
- *
- * Called directly by both the single-product and bulk branches. Bulk used to
- * re-enter `action` with a hand-built Request, which silently broke: the new
- * Request carried the ORIGINAL request's Content-Type, so its freshly built
- * multipart body was parsed under the outer urlencoded header, `actionType`
- * came back null, and every product fell through to "Invalid action" while the
- * bulk branch still reported success. Calling the function is also cheaper —
- * no re-authentication and no repeat billing lookup per product.
- */
-async function optimizeOneProduct({ admin, session, productId, quota }) {
-  // How many images this product needs isn't known until we've fetched it, so
-  // we can't reserve the exact amount up front. Requiring one unit of headroom
-  // and recording the true count afterwards stops a shop at its limit from
-  // starting new work, without ever abandoning a product halfway through.
-  const headroom = await checkQuota(quota, METRICS.IMAGES_OPTIMIZED, 1);
-  if (!headroom.allowed) {
-    return {
-      success: false,
-      // Flagged so a multi-product run can stop here instead of asking for
-      // every remaining product and collecting the same refusal each time.
-      quotaExhausted: true,
-      error: quotaMessage(METRICS.IMAGES_OPTIMIZED, headroom),
-    };
-  }
-
-  try {
-    // Fetch product media (MediaImage nodes give us the ids the current
-    // GraphQL create/delete mutations require) plus any existing optimization
-    // metafields so we can carry forward the TRUE original size on re-optimize.
-    const response = await admin.graphql(
-      `#graphql
-        query GetProductMedia($id: ID!) {
-          product(id: $id) {
-            id
-            title
-            media(first: 250) {
-              edges {
-                node {
-                  mediaContentType
-                  ... on MediaImage {
-                    id
-                    alt
-                    image {
-                      url
-                    }
-                  }
-                }
-              }
-            }
-            metafields(first: 20, namespace: "image_optimization") {
-              edges { node { key value } }
-            }
-          }
-        }
-      `,
-      { variables: { id: productId } }
-    );
-
-    const data = await response.json();
-    const product = data.data.product;
-
-    // Map existing per-image records by their key so that when we re-optimize
-    // an already-optimized image we keep the ORIGINAL (pre-optimization) size
-    // instead of measuring the already-compressed one — otherwise re-optimizing
-    // would report ~0 savings.
-    const existingByKey = {};
-    for (const edge of (product.metafields?.edges || [])) {
-      if (!edge.node.key.startsWith('image_')) continue;
-      try { existingByKey[edge.node.key] = JSON.parse(edge.node.value); } catch (e) {}
-    }
-
-    const images = product.media.edges
-      .map(edge => edge.node)
-      .filter(node => node && node.mediaContentType === 'IMAGE' && node.image && node.image.url)
-      .map(node => ({ id: node.id, url: node.image.url, altText: node.alt || '' }));
-
-    const optimizationResults = [];
-
-    // This flow also generates AI alt text for images that lack it, which is a
-    // real OpenAI/Anthropic call and must come out of the SAME ai_alt_text
-    // allowance the Alt Text page spends — otherwise a merchant gets unlimited
-    // AI simply by routing it through the optimizer.
-    //
-    // Running out of AI quota does NOT abort the optimization: the image work
-    // is separately metered and already permitted, so we just stop generating
-    // alt text and leave what's on the image.
-    const aiCheck = await checkQuota(quota, METRICS.AI_ALT_TEXT, 1);
-    let aiRemaining = aiCheck.limit === Number.POSITIVE_INFINITY
-      ? Number.POSITIVE_INFINITY
-      : aiCheck.remaining;
-    let aiCalls = 0;
-
-    for (const image of images) {
-      try {
-        const format = getImageFormat(image.url);
-
-        // Optimize image with Sharp. This downloads the original once and
-        // returns its size, so we don't fetch the image a second time.
-        const optimizationData = await optimizeImage(image.url, format);
-
-        // Carry forward the TRUE original size. If this image is itself the
-        // output of a previous optimization, its existing record holds the real
-        // pre-optimization size — keep the larger of that and what we just
-        // measured, so re-optimizing an already-small image still reflects the
-        // full saving instead of ~0.
-        const prevRec = existingByKey[`image_${image.id.split('/').pop()}`];
-        const measuredOriginalMB = optimizationData.originalSizeMB;
-        const newOptimizedMB = optimizationData.optimizedSizeMB;
-        const trueOriginalMB = (prevRec && Number(prevRec.originalSizeMB) > measuredOriginalMB)
-          ? Number(prevRec.originalSizeMB)
-          : measuredOriginalMB;
-
-        // Generate AI alt text if missing, budget permitting.
-        let altText = image.altText;
-        if ((!altText || altText.length < 10) && aiRemaining > 0) {
-          altText = await generateAIAltText(image.url, product.title);
-          aiCalls += 1;
-          aiRemaining -= 1;
-        }
-
-        // Only replace the image if the re-encoded version is at least 2%
-        // SMALLER than what is on the store now. Many images are already
-        // optimized (small WebP/JPEG) and re-encoding them is larger — replacing
-        // in that case would INFLATE the file and delete the smaller original.
-        const beneficial = newOptimizedMB < measuredOriginalMB * 0.98;
-
-        if (!beneficial) {
-          // Already optimized: keep the current image. Update alt text only if we
-          // generated/changed it, and record the image honestly (0 further
-          // saving, but preserve any real historical saving from trueOriginal).
-          if (altText && altText !== image.altText) {
-            try {
-              await admin.graphql(
-                `#graphql
-                  mutation UpdateAlt($productId: ID!, $media: [UpdateMediaInput!]!) {
-                    productUpdateMedia(productId: $productId, media: $media) {
-                      media { id }
-                      mediaUserErrors { field message }
-                    }
-                  }
-                `,
-                { variables: { productId, media: [{ id: image.id, alt: altText }] } }
-              );
-            } catch (altErr) {
-              console.error('Alt update failed (non-fatal):', altErr.message);
-            }
-          }
-
-          const imageKey = `image_${image.id.split('/').pop()}`;
-          const compressionRate = trueOriginalMB > 0
-            ? Math.round(((trueOriginalMB - measuredOriginalMB) / trueOriginalMB) * 100)
-            : 0;
-          await admin.graphql(
-            `#graphql
-              mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
-                metafieldsSet(metafields: $metafields) {
-                  metafields { key value }
-                  userErrors { field message }
-                }
-              }
-            `,
-            {
-              variables: {
-                metafields: [
-                  {
-                    ownerId: productId,
-                    namespace: 'image_optimization',
-                    key: imageKey,
-                    value: JSON.stringify({
-                      originalSizeMB: trueOriginalMB,
-                      optimizedSizeMB: measuredOriginalMB,
-                      compressionRate,
-                      format,
-                      altText,
-                      alreadyOptimized: true,
-                      optimizedAt: new Date().toISOString(),
-                      originalImageId: image.id,
-                      newImageId: image.id
-                    }),
-                    type: 'json'
-                  }
-                ]
-              }
-            }
-          );
-
-          optimizationResults.push({
-            imageId: image.id,
-            originalImageId: image.id,
-            originalSize: trueOriginalMB,
-            optimizedSize: measuredOriginalMB,
-            compressionRate,
-            alreadyOptimized: true,
-            altText,
-            success: true
-          });
-          continue;
-        }
-
-        const compressionRate = trueOriginalMB > 0
-          ? Math.round(((trueOriginalMB - newOptimizedMB) / trueOriginalMB) * 100)
-          : optimizationData.compressionRate;
-
-        // Determine output format (optimizeImage outputs WebP for webp/png
-        // sources, otherwise JPEG) so we name/type the upload correctly.
-        const outIsWebp = format === 'webp' || format === 'png';
-        const outMime = outIsWebp ? 'image/webp' : 'image/jpeg';
-        const outFilename = `optimized-${Date.now()}.${outIsWebp ? 'webp' : 'jpg'}`;
-
-        // Upload optimized image (GraphQL) and replace the original
-        const newImageId = await uploadAndReplaceImage(
-          admin,
-          productId,
-          image.id,
-          optimizationData.optimizedBuffer,
-          outFilename,
-          outMime,
-          altText
-        );
-
-        // Save optimization metadata
-        const imageKey = `image_${newImageId.split('/').pop()}`;
-        await admin.graphql(
-          `#graphql
-            mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
-              metafieldsSet(metafields: $metafields) {
-                metafields {
-                  key
-                  value
-                }
-                userErrors {
-                  field
-                  message
-                }
-              }
-            }
-          `,
-          {
-            variables: {
-              metafields: [
-                {
-                  ownerId: productId,
-                  namespace: 'image_optimization',
-                  key: imageKey,
-                  value: JSON.stringify({
-                    originalSizeMB: trueOriginalMB,
-                    optimizedSizeMB: newOptimizedMB,
-                    compressionRate: compressionRate,
-                    format: format,
-                    altText: altText,
-                    optimizedAt: new Date().toISOString(),
-                    originalImageId: image.id,
-                    newImageId: newImageId
-                  }),
-                  type: 'json'
-                }
-              ]
-            }
-          }
-        );
-
-        optimizationResults.push({
-          imageId: newImageId,
-          originalImageId: image.id,
-          originalSize: trueOriginalMB,
-          optimizedSize: newOptimizedMB,
-          compressionRate: compressionRate,
-          altText,
-          success: true
-        });
-
-      } catch (imageError) {
-        console.error(`Error optimizing image ${image.id}:`, imageError);
-        optimizationResults.push({
-          imageId: image.id,
-          success: false,
-          error: imageError.message
-        });
-      }
-    }
-
-    // Save product-level optimization summary
-    const successfulOptimizations = optimizationResults.filter(r => r.success);
-    
-    await admin.graphql(
-      `#graphql
-        mutation CreateMetafield($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) {
-            metafields {
-              key
-              value
-            }
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `,
-      {
-        variables: {
-          metafields: [
-            {
-              ownerId: productId,
-              namespace: 'image_optimization',
-              key: 'optimization_summary',
-              value: JSON.stringify({
-                totalImages: images.length,
-                optimizedImages: successfulOptimizations.length,
-                totalOriginalSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.originalSize, 0),
-                totalOptimizedSizeMB: successfulOptimizations.reduce((sum, r) => sum + r.optimizedSize, 0),
-                totalSizeSavedMB: successfulOptimizations.reduce((sum, r) => sum + (r.originalSize - r.optimizedSize), 0),
-                avgCompressionRate: successfulOptimizations.length > 0 
-                  ? Math.round(successfulOptimizations.reduce((sum, r) => sum + r.compressionRate, 0) / successfulOptimizations.length)
-                  : 0,
-                lastOptimizedAt: new Date().toISOString()
-              }),
-              type: 'json'
-            }
-          ]
-        }
-      }
-    );
-
-    const compressed = successfulOptimizations.filter(r => !r.alreadyOptimized);
-    const skipped = successfulOptimizations.filter(r => r.alreadyOptimized);
-    const totalSaved = compressed.reduce((sum, r) => sum + Math.max(r.originalSize - r.optimizedSize, 0), 0);
-
-    // Only images we actually re-encoded and uploaded count against the quota.
-    // Ones already at their smallest cost nothing, so charging for them would
-    // penalise a merchant for re-running the optimizer. AI calls are billed
-    // whether or not the image turned out to be worth recompressing, so they
-    // are counted independently of `compressed`.
-    await recordUsage(session.shop, METRICS.IMAGES_OPTIMIZED, compressed.length);
-    await recordUsage(session.shop, METRICS.AI_ALT_TEXT, aiCalls);
-
-    let message;
-    if (compressed.length > 0) {
-      message = `Compressed ${compressed.length} image${compressed.length > 1 ? 's' : ''} for "${product.title}" — saved ${totalSaved >= 1 ? totalSaved.toFixed(1) + ' MB' : Math.round(totalSaved * 1024) + ' KB'}.`;
-    } else if (skipped.length > 0) {
-      message = `"${product.title}" is already optimized — its ${skipped.length} image${skipped.length > 1 ? 's are' : ' is'} already as small as possible, so nothing was changed.`;
-    } else {
-      message = `No images could be processed for "${product.title}".`;
-    }
-
-    return {
-      success: true,
-      message,
-      results: optimizationResults
-    };
-
-  } catch (error) {
-    console.error('Error optimizing product:', error);
-    return {
-      success: false,
-      error: 'Failed to optimize product: ' + error.message
-    };
-  }
-}
-
 export async function action({ request }) {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
-  const actionType = formData.get('actionType');
+  const productId = formData.get('productId');
 
-  if (actionType === 'optimizeProduct') {
-    const productId = formData.get('productId');
-    const quota = await quotaContext(admin, session);
-    return optimizeOneProduct({ admin, session, productId, quota });
+  if (!productId) {
+    return { success: false, error: 'No product was selected.' };
   }
 
-  if (actionType === 'optimizeBulk') {
-    let productIds;
-    try {
-      productIds = JSON.parse(formData.get('productIds'));
-    } catch (err) {
-      return { success: false, error: 'Could not read the selected products.' };
-    }
-    if (!Array.isArray(productIds) || productIds.length === 0) {
-      return { success: false, error: 'No products were selected.' };
-    }
-
-    // Resolved once: a shop's tier cannot change mid-run, and resolving it per
-    // product would add a Shopify billing round-trip each. The per-product quota
-    // check inside optimizeOneProduct still re-reads the counter, which
-    // recordUsage has already incremented, so a bulk run stops when the plan
-    // runs out instead of sailing past the limit.
-    const quota = await quotaContext(admin, session);
-
-    const results = [];
-    for (const productId of productIds) {
-      try {
-        results.push(await optimizeOneProduct({ admin, session, productId, quota }));
-      } catch (error) {
-        console.error('Bulk optimize failed for %s:', productId, error);
-        results.push({ success: false, error: error.message });
-      }
-    }
-
-    const succeeded = results.filter((r) => r.success);
-    const failed = results.filter((r) => !r.success);
-
-    // Surface the first real reason rather than a bare count. When a bulk run
-    // stops because the plan quota ran out, that is what the merchant needs to
-    // read — "0 out of 12" on its own explains nothing.
-    if (succeeded.length === 0) {
-      return {
-        success: false,
-        error: failed[0]?.error || 'None of the selected products could be optimized.',
-      };
-    }
-
-    let message = `Optimized ${succeeded.length} of ${productIds.length} product${productIds.length > 1 ? 's' : ''}.`;
-    if (failed.length > 0) {
-      message += ` ${failed.length} could not be processed — ${failed[0].error}`;
-    }
-
-    return { success: true, message };
-  }
-
-  return { success: false, error: 'Invalid action' };
+  const quota = await quotaContext(admin, session);
+  return optimizeWholeProduct({ admin, quota, productId });
 }
 
 /**
- * Generate AI alt text using Anthropic Claude Vision
+ * How many images of the same product are optimized at once.
+ *
+ * Each image is mostly waiting — on the CDN download, on the staged upload, on
+ * the AI call — so running a few together is where the wall-clock saving comes
+ * from. Kept small on purpose: every image costs four or five Shopify
+ * mutations, and a wider pool just trades one queue for the API's own throttle.
  */
-async function generateAIAltText(imageUrl, productTitle) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return `${productTitle} - product image`;
-  }
+const IMAGE_CONCURRENCY = 3;
 
-  try {
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error('Failed to fetch image');
+/** MB as something a person can read, never as a confusing "0.0 MB". */
+function formatBytes(mb) {
+  const val = Number(mb) || 0;
+  if (val >= 1000) return `${(val / 1000).toFixed(1)} GB`;
+  if (val < 1) return `${Math.max(0, Math.round(val * 1024))} KB`;
+  return `${val.toFixed(1)} MB`;
+}
+
+/** Work through `items` with at most `limit` in flight at any moment. */
+async function pooled(items, limit, worker, shouldStop) {
+  let cursor = 0;
+  const runners = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      // Claiming the next index with a post-increment is safe here: JavaScript
+      // runs one worker at a time between awaits, so no two can claim the same
+      // item.
+      let index = cursor++;
+      while (index < items.length) {
+        if (shouldStop()) return;
+        await worker(items[index], index);
+        index = cursor++;
+      }
     }
-    
-    const imageBuffer = await imageResponse.arrayBuffer();
-    const base64Image = Buffer.from(imageBuffer).toString('base64');
-    
-    let mediaType = 'image/jpeg';
-    if (imageUrl.toLowerCase().includes('.png')) mediaType = 'image/png';
-    if (imageUrl.toLowerCase().includes('.webp')) mediaType = 'image/webp';
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 150,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: mediaType,
-                data: base64Image
-              }
-            },
-            {
-              type: 'text',
-              text: `Generate SEO-optimized alt text for this ${productTitle} image. Include: product type, color, material, style. Keep under 125 characters. Return only the alt text.`
-            }
-          ]
-        }]
-      })
-    });
-
-    const result = await response.json();
-    let altText = result.content[0].text.trim();
-    altText = altText.replace(/^["']|["']$/g, '').replace(/\n/g, ' ');
-    
-    if (altText.length > 125) {
-      altText = altText.substring(0, 122) + '...';
-    }
-    
-    return altText;
-
-  } catch (error) {
-    console.error('Error generating AI alt text:', error);
-    return `${productTitle} - product image`;
-  }
+  );
+  await Promise.all(runners);
 }
 
 export default function ProductOptimization() {
   const { products: initialProducts, filter: initialFilter, sortBy: initialSortBy, stats, error: loadError } = useLoaderData();
-  const fetcher = useFetcher();
   const revalidator = useRevalidator();
 
   const [products, setProducts] = useState(initialProducts);
@@ -1100,36 +478,41 @@ export default function ProductOptimization() {
   const [successMessage, setSuccessMessage] = useState(null);
 
   /**
-   * An optimization run, driven one product per request from the browser.
+   * An optimization run, driven one IMAGE per request from the browser.
    *
-   * The server used to take the whole selection in a single request and stay
-   * silent until every product was done, so the page could only show a spinner
-   * — there was no honest number to put in a progress bar. Asking for one
-   * product at a time means each response IS a progress event: real counts,
-   * real per-product results, and no request long enough to hit a proxy
-   * timeout on a big selection.
+   * The unit used to be a whole product, which is why a product with eight
+   * images looked frozen: one request went out and nothing came back until all
+   * eight were done. Now every image is its own request, so each response is a
+   * progress event — that is what makes "image 3 of 8" a real number rather
+   * than a guess — and a few images can be in flight together, which is where
+   * the speed comes from.
    *
-   * { ids: string[], index: number, results: [] }
+   * The live counters live in a ref and are published into state, because a
+   * handful of concurrent workers all updating the same tallies through
+   * setState callbacks is far easier to get wrong.
    */
   const [run, setRun] = useState(null);
-  // Which index we've already handed to the server, so the effect below can
-  // tell "not submitted yet" apart from "finished, result is waiting".
-  const submittedIndex = useRef(-1);
-  // fetcher.data still holds the PREVIOUS product's response during the gap
-  // between submitting the next one and that request going in flight. Without
-  // remembering which response we've already banked, that stale object gets
-  // recorded a second time against the wrong product.
-  const consumedData = useRef(null);
+  const runRef = useRef(null);
+  // Set by the Stop button and by a quota refusal; every worker checks it.
+  const stopRef = useRef(false);
+
+  const publish = useCallback(() => {
+    const state = runRef.current;
+    setRun(state ? { ...state, images: state.images.map((img) => ({ ...img })) } : null);
+  }, []);
 
   const isRunning = run !== null;
   const isBusy = isRunning || revalidator.state !== 'idle';
 
-  const activeId = run ? run.ids[run.index] : null;
-  const activeProduct = activeId ? products.find(p => p.id === activeId) : null;
+  const activeId = run ? run.productIds[run.productIndex] : null;
 
-  const completed = run ? run.results.length : 0;
-  const total = run ? run.ids.length : 0;
-  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const imagesSettled = run ? run.imagesDone + run.imagesFailed : 0;
+  const progress = run && run.totalImages > 0
+    ? Math.min(100, Math.round((imagesSettled / run.totalImages) * 100))
+    : 0;
+  const productImagesSettled = run
+    ? run.images.filter((img) => img.status !== 'pending' && img.status !== 'working').length
+    : 0;
 
   // Keep local products in sync when the loader revalidates (e.g. after an
   // optimization reload).
@@ -1152,86 +535,256 @@ export default function ProductOptimization() {
     return sorted;
   }, [products, filter, sortBy]);
 
-  // Summarise a finished run, then refresh the product data once.
-  const finishRun = useCallback((results, stoppedEarly) => {
+  /**
+   * One call to the per-image API.
+   *
+   * App Bridge already adds the session token to relative fetches, but the
+   * token is requested explicitly here so authentication doesn't depend on
+   * that patch being in place — a silent 401 partway through a run is a
+   * miserable thing to debug.
+   */
+  const callApi = useCallback(async (fields) => {
+    const body = new FormData();
+    for (const [key, value] of Object.entries(fields)) {
+      body.append(key, value);
+    }
+
+    const headers = {};
+    try {
+      const token = await window.shopify?.idToken?.();
+      if (token) headers.Authorization = `Bearer ${token}`;
+    } catch (err) {
+      // Fall through — App Bridge's own fetch patch is the backstop.
+    }
+
+    const response = await fetch('/api/optimize', { method: 'POST', body, headers });
+
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (err) {
+      /* fall through to the status-based message below */
+    }
+
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Your session expired. Reload the page and try again.');
+      }
+      throw new Error(data?.error || `The server returned an error (${response.status}).`);
+    }
+    if (!data) {
+      // A 200 with an unreadable body would otherwise be read as a result and
+      // crash the worker on the first property access.
+      throw new Error('The server sent back an empty response.');
+    }
+    return data;
+  }, []);
+
+  const executeRun = useCallback(async (productIds) => {
+    const byId = new Map(products.map((p) => [p.id, p]));
+
+    runRef.current = {
+      productIds,
+      productIndex: 0,
+      productTitle: byId.get(productIds[0])?.title || '',
+      // Seeded from the counts already on screen so the bar is honest from the
+      // first frame instead of climbing as each product is discovered. Replaced
+      // with the authoritative count as each product is opened.
+      totalImages: productIds.reduce(
+        (sum, id) => sum + (byId.get(id)?.imageCount || 0),
+        0
+      ),
+      imagesDone: 0,
+      imagesCompressed: 0,
+      imagesSkipped: 0,
+      imagesFailed: 0,
+      savedMB: 0,
+      images: [],
+      recent: [],
+      stopping: false,
+    };
+    publish();
+
+    let quotaError = null;
+    let lastError = null;
+
+    for (let i = 0; i < productIds.length; i++) {
+      if (stopRef.current) break;
+
+      const productId = productIds[i];
+      const state = runRef.current;
+      state.productIndex = i;
+      state.productTitle = byId.get(productId)?.title || '';
+      state.images = [];
+      publish();
+
+      let listing;
+      try {
+        listing = await callApi({ intent: 'listImages', productId });
+      } catch (err) {
+        lastError = err.message;
+        // Drop this product's estimate, otherwise its images stay in the total
+        // forever and the bar can never reach 100%.
+        state.totalImages -= byId.get(productId)?.imageCount || 0;
+        publish();
+        continue;
+      }
+
+      // Correct the estimate for this product with what is actually there.
+      state.totalImages += listing.images.length - (byId.get(productId)?.imageCount || 0);
+      state.productTitle = listing.title;
+      state.images = listing.images.map((image) => ({
+        id: image.id,
+        url: image.url,
+        status: 'pending',
+        detail: null,
+      }));
+      publish();
+
+      // The id each slot ends up holding, so the original order can be restored
+      // afterwards — replacing an image appends the copy at the end, and with
+      // several in flight they no longer finish in the order they started.
+      const finalIds = listing.images.map((image) => image.id);
+
+      await pooled(
+        listing.images,
+        IMAGE_CONCURRENCY,
+        async (image, index) => {
+          const entry = runRef.current.images[index];
+          entry.status = 'working';
+          publish();
+
+          let result;
+          try {
+            result = await callApi({ intent: 'optimizeImage', productId, imageId: image.id });
+          } catch (err) {
+            result = { success: false, error: err.message };
+          }
+
+          const live = runRef.current;
+
+          // Once the plan's quota is gone every remaining image returns the
+          // same refusal, so the whole run stops here.
+          if (result.quotaExhausted) {
+            quotaError = result.error;
+            stopRef.current = true;
+            entry.status = 'pending';
+            publish();
+            return;
+          }
+
+          if (result.success) {
+            finalIds[index] = result.newImageId || image.id;
+            live.imagesDone += 1;
+            if (result.alreadyOptimized) {
+              live.imagesSkipped += 1;
+              entry.status = 'skipped';
+              entry.detail = 'Already optimal';
+            } else {
+              live.imagesCompressed += 1;
+              live.savedMB += result.savedMB || 0;
+              entry.status = 'done';
+              entry.detail = `−${result.compressionRate}%`;
+              live.recent = [
+                {
+                  key: result.newImageId,
+                  text: `${listing.title} — ${formatBytes(result.originalSizeMB)} → ${formatBytes(result.optimizedSizeMB)} (−${result.compressionRate}%)`,
+                },
+                ...live.recent,
+              ].slice(0, 4);
+            }
+          } else {
+            live.imagesFailed += 1;
+            lastError = result.error;
+            entry.status = 'failed';
+            entry.detail = result.error;
+          }
+          publish();
+        },
+        () => stopRef.current
+      );
+
+      // Rewrite the summary and put the image order back, even for a partial
+      // product — the stored numbers should describe what is on the store now.
+      try {
+        await callApi({
+          intent: 'finalize',
+          productId,
+          order: JSON.stringify(finalIds),
+        });
+      } catch (err) {
+        console.error('Could not finalize %s:', productId, err);
+      }
+    }
+
+    const final = runRef.current;
+    const stoppedByUser = final.stopping;
+
+    runRef.current = null;
+    stopRef.current = false;
     setRun(null);
-    submittedIndex.current = -1;
     setSelectedProducts([]);
 
-    const ok = results.filter(r => r.success);
-    const failed = results.filter(r => !r.success);
-
-    if (ok.length === 0 && failed.length > 0) {
-      setError(failed[0].error || 'Optimization failed.');
+    if (final.imagesDone === 0 && final.imagesFailed === 0) {
+      // Stopping on purpose before anything finished isn't a failure.
+      if (stoppedByUser && !quotaError) {
+        setSuccessMessage('Stopped — nothing was changed.');
+        setTimeout(() => setSuccessMessage(null), 8000);
+      } else {
+        setError(quotaError || lastError || 'Nothing was optimized.');
+      }
+    } else if (final.imagesDone === 0) {
+      setError(lastError || 'None of the images could be optimized.');
     } else {
-      let summary = ok.length === 1 && ok[0].message
-        ? ok[0].message
-        : `Optimized ${ok.length} of ${results.length} product${results.length > 1 ? 's' : ''}.`;
-      if (failed.length > 0) {
-        summary += ` ${failed.length} could not be processed — ${failed[0].error}`;
+      const parts = [];
+      if (final.imagesCompressed > 0) {
+        parts.push(
+          `Compressed ${final.imagesCompressed} image${final.imagesCompressed > 1 ? 's' : ''} — saved ${formatBytes(final.savedMB)}.`
+        );
       }
-      if (stoppedEarly) {
-        summary += ' Remaining products were skipped.';
+      if (final.imagesSkipped > 0) {
+        parts.push(
+          `${final.imagesSkipped} image${final.imagesSkipped > 1 ? 's were' : ' was'} already as small as possible.`
+        );
       }
-      setSuccessMessage(summary);
-      setTimeout(() => setSuccessMessage(null), 8000);
+      if (final.imagesFailed > 0) {
+        parts.push(`${final.imagesFailed} could not be processed — ${lastError}`);
+      }
+      if (quotaError) parts.push(quotaError);
+      else if (stoppedByUser) parts.push('You stopped the run; the rest were left alone.');
+
+      setSuccessMessage(parts.join(' '));
+      setTimeout(() => setSuccessMessage(null), 12000);
     }
 
-    // One refresh at the end rather than after every product — the numbers only
+    // One refresh at the end rather than after every image — the numbers only
     // need to be right when the merchant looks at them again.
     revalidator.revalidate();
-  }, [revalidator]);
-
-  // Drives the queue: submit the current product, record its result, advance.
-  useEffect(() => {
-    if (!run) return;
-    if (fetcher.state !== 'idle') return;
-
-    // The request we sent has come back — record it and move on. The identity
-    // check is what proves this is a NEW response rather than the last one.
-    if (
-      submittedIndex.current === run.index &&
-      fetcher.data &&
-      fetcher.data !== consumedData.current
-    ) {
-      consumedData.current = fetcher.data;
-      const results = [...run.results, { id: run.ids[run.index], ...fetcher.data }];
-      const nextIndex = run.index + 1;
-
-      // No point asking for the rest once the plan's quota is gone; every one
-      // would come back with the same refusal.
-      if (fetcher.data.quotaExhausted) {
-        finishRun(results, nextIndex < run.ids.length);
-        return;
-      }
-      if (nextIndex >= run.ids.length) {
-        finishRun(results, false);
-        return;
-      }
-      setRun({ ...run, index: nextIndex, results });
-      return;
-    }
-
-    // Otherwise this index hasn't been sent yet.
-    if (submittedIndex.current !== run.index) {
-      submittedIndex.current = run.index;
-      const formData = new FormData();
-      formData.append('actionType', 'optimizeProduct');
-      formData.append('productId', run.ids[run.index]);
-      fetcher.submit(formData, { method: 'post' });
-    }
-  }, [run, fetcher, fetcher.state, fetcher.data, finishRun]);
+  }, [products, callApi, publish, revalidator]);
 
   const startRun = useCallback((ids) => {
-    if (!ids.length) return;
+    if (!ids.length || runRef.current) return;
     setError(null);
     setSuccessMessage(null);
-    submittedIndex.current = -1;
-    // Whatever the fetcher is still holding belongs to a previous run — mark it
-    // consumed so the first product of this one can't inherit it.
-    consumedData.current = fetcher.data ?? null;
-    setRun({ ids, index: 0, results: [] });
-  }, [fetcher.data]);
+    stopRef.current = false;
+    executeRun(ids).catch((err) => {
+      // A throw here would leave the page stuck showing progress forever.
+      console.error('Optimization run crashed:', err);
+      runRef.current = null;
+      stopRef.current = false;
+      setRun(null);
+      setError(err.message || 'The optimization run stopped unexpectedly.');
+      revalidator.revalidate();
+    });
+  }, [executeRun, revalidator]);
+
+  const handleStopRun = useCallback(() => {
+    stopRef.current = true;
+    if (runRef.current) {
+      runRef.current.stopping = true;
+      publish();
+    }
+  }, [publish]);
 
   // Filter/sort are client-side now — just update local state (no server reload).
   const handleFilterChange = useCallback((value) => {
@@ -1272,15 +825,6 @@ export default function ProductOptimization() {
     return <Badge tone="critical">{score}%</Badge>;
   };
 
-  const formatBytes = (mb) => {
-    const val = Number(mb) || 0;
-    if (val >= 1000) return `${(val / 1000).toFixed(1)} GB`;
-    // Show KB for anything under 1 MB so small (but real) savings — and zero —
-    // never collapse to a confusing "0.0 MB".
-    if (val < 1) return `${Math.max(0, Math.round(val * 1024))} KB`;
-    return `${val.toFixed(1)} MB`;
-  };
-
   const filterOptions = [
     { label: 'All Products', value: 'all' },
     { label: 'Needs Optimization', value: 'needs_optimization' },
@@ -1309,33 +853,94 @@ export default function ProductOptimization() {
                   <InlineStack gap="300" blockAlign="center">
                     <Spinner accessibilityLabel="Optimization in progress" size="small" />
                     <Text variant="headingMd" as="h3">
-                      {total > 1
-                        ? `Optimizing ${completed + 1} of ${total} products…`
-                        : 'Optimizing…'}
+                      {run.stopping
+                        ? 'Finishing the images already started…'
+                        : run.images.length > 0
+                          ? `Optimizing image ${Math.min(productImagesSettled + 1, run.images.length)} of ${run.images.length}…`
+                          : 'Reading the product’s images…'}
                     </Text>
                   </InlineStack>
-                  <Text variant="headingMd" as="p" tone="subdued">{progress}%</Text>
+                  <InlineStack gap="300" blockAlign="center">
+                    <Text variant="headingMd" as="p" tone="subdued">{progress}%</Text>
+                    {!run.stopping && (
+                      <Button variant="tertiary" onClick={handleStopRun}>Stop</Button>
+                    )}
+                  </InlineStack>
                 </InlineStack>
 
                 <ProgressBar progress={progress} size="small" tone="primary" />
 
                 <Text variant="bodyMd" as="p">
-                  {activeProduct
-                    ? <>Currently: <Text as="span" fontWeight="semibold">{activeProduct.title}</Text></>
+                  {run.productTitle
+                    ? <Text as="span" fontWeight="semibold">{run.productTitle}</Text>
                     : 'Starting…'}
+                  {run.productIds.length > 1 &&
+                    ` — product ${run.productIndex + 1} of ${run.productIds.length}`}
                 </Text>
 
-                {run.results.length > 0 && (
-                  <Text variant="bodySm" as="p" tone="subdued">
-                    {run.results.filter(r => r.success).length} done
-                    {run.results.some(r => !r.success) &&
-                      `, ${run.results.filter(r => !r.success).length} failed`}
-                  </Text>
+                {/* One tile per image on this product, so "how many are done"
+                    is something the merchant can see rather than infer. */}
+                {run.images.length > 0 && (
+                  <InlineStack gap="200" wrap={true}>
+                    {run.images.map((image, index) => (
+                      <BlockStack key={image.id} gap="100" inlineAlign="center">
+                        <Box
+                          borderWidth="050"
+                          borderRadius="200"
+                          borderColor={
+                            image.status === 'done' ? 'border-success'
+                              : image.status === 'failed' ? 'border-critical'
+                                : image.status === 'working' ? 'border-emphasis'
+                                  : 'border'
+                          }
+                          padding="050"
+                        >
+                          <Thumbnail
+                            source={image.url}
+                            alt={`Image ${index + 1}`}
+                            size="small"
+                          />
+                        </Box>
+                        {image.status === 'working' ? (
+                          <Spinner accessibilityLabel={`Optimizing image ${index + 1}`} size="small" />
+                        ) : (
+                          <Text variant="bodySm" as="span" tone={
+                            image.status === 'done' ? 'success'
+                              : image.status === 'failed' ? 'critical'
+                                : 'subdued'
+                          }>
+                            {image.status === 'done' ? image.detail
+                              : image.status === 'skipped' ? 'Optimal'
+                                : image.status === 'failed' ? 'Failed'
+                                  : `#${index + 1}`}
+                          </Text>
+                        )}
+                      </BlockStack>
+                    ))}
+                  </InlineStack>
                 )}
 
                 <Text variant="bodySm" as="p" tone="subdued">
-                  Each image is downloaded, re-compressed and uploaded back to Shopify, so this
-                  takes a while on products with many images. Please keep this page open.
+                  {imagesSettled} of {run.totalImages} image{run.totalImages === 1 ? '' : 's'} done
+                  {run.imagesCompressed > 0 && ` · ${formatBytes(run.savedMB)} saved`}
+                  {run.imagesSkipped > 0 && ` · ${run.imagesSkipped} already optimal`}
+                  {run.imagesFailed > 0 && ` · ${run.imagesFailed} failed`}
+                </Text>
+
+                {run.recent.length > 0 && (
+                  <BlockStack gap="100">
+                    {run.recent.map((entry) => (
+                      <Text key={entry.key} variant="bodySm" as="p" tone="subdued">
+                        ✓ {entry.text}
+                      </Text>
+                    ))}
+                  </BlockStack>
+                )}
+
+                <Text variant="bodySm" as="p" tone="subdued">
+                  Up to {IMAGE_CONCURRENCY} images are processed at a time. Each one is
+                  downloaded, re-compressed and uploaded back to Shopify, so please keep this
+                  page open.
                 </Text>
               </BlockStack>
             </Card>

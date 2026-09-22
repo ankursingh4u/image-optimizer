@@ -120,10 +120,45 @@ export function currentPeriod(now = new Date()) {
 }
 
 /**
+ * Short-lived cache of resolved plan tiers.
+ *
+ * `quotaContext` costs a Shopify billing round-trip, which was fine when one
+ * request optimized a whole product but is not when the browser sends one
+ * request per image. A shop's tier cannot meaningfully change inside a single
+ * run, so it is memoized briefly. Only the TIER is cached — `checkQuota` and
+ * `reserveUsage` always read the live counter, so quotas stay exact.
+ *
+ * The window is deliberately short: after an upgrade a merchant sees their new
+ * limits within it. Access is unaffected either way — the gate in app.jsx
+ * resolves the subscription directly and is never served from here.
+ */
+const TIER_CACHE_TTL_MS = 30_000;
+const tierCache = new Map();
+
+/** Drop a shop's cached tier — call after a plan change. */
+export function invalidateQuotaContext(shop) {
+  tierCache.delete(shop);
+}
+
+/**
  * Everything a metered route needs to decide whether to proceed.
  * One call, so routes don't each re-derive the shop's plan.
  */
 export async function quotaContext(admin, session) {
+  const cached = tierCache.get(session.shop);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.context;
+  }
+
+  const context = await resolveQuotaContext(admin, session);
+  tierCache.set(session.shop, {
+    context,
+    expiresAt: Date.now() + TIER_CACHE_TTL_MS,
+  });
+  return context;
+}
+
+async function resolveQuotaContext(admin, session) {
   const { isTestShop } = resolveBillingMode(session.shop);
 
   const [subscription, hasGrandfatherRow] = await Promise.all([
@@ -195,6 +230,96 @@ export function quotaMessage(metric, check) {
     return `You've used all ${check.limit} ${label} included in your plan this month. Upgrade from the Plan page for a higher limit, or wait for the counter to reset next month.`;
   }
   return `That would exceed your monthly limit of ${check.limit} ${label} — you have ${check.remaining} left. Upgrade from the Plan page for a higher limit.`;
+}
+
+/**
+ * Claim `amount` of a metric up front, atomically.
+ *
+ * `checkQuota` then `recordUsage` is only safe while one unit of work is in
+ * flight at a time. With several images optimizing at once, each could read
+ * "1 remaining" and all proceed. Incrementing first and refunding when the
+ * result exceeds the limit makes the decision atomic in the database, so a
+ * shop can never be handed more than its plan allows.
+ *
+ * Callers must refund what they reserve but don't end up using.
+ */
+/**
+ * Add to a counter and return its new value.
+ *
+ * The P2002 retry matters for the first unit of a period: two images starting
+ * together both see no row and both try to CREATE it, so one loses on the
+ * unique index. Retrying as a plain increment is correct because the row the
+ * winner created is exactly the row we wanted.
+ */
+async function incrementCounter(shop, metric, period, amount) {
+  try {
+    const row = await prisma.usageCounter.upsert({
+      where: { shop_metric_period: { shop, metric, period } },
+      create: { shop, metric, period, count: amount },
+      update: { count: { increment: amount } },
+    });
+    return row.count;
+  } catch (err) {
+    if (err?.code !== "P2002") throw err;
+    const row = await prisma.usageCounter.update({
+      where: { shop_metric_period: { shop, metric, period } },
+      data: { count: { increment: amount } },
+    });
+    return row.count;
+  }
+}
+
+export async function reserveUsage(ctx, metric, amount = 1) {
+  const limit = ctx.limits?.[metric] ?? UNLIMITED;
+  const period = currentPeriod();
+
+  // Unlimited shops are still counted — the Plan page reports usage for every
+  // tier — they just never get refused below.
+  let after;
+  try {
+    after = await incrementCounter(ctx.shop, metric, period, amount);
+  } catch (err) {
+    console.error(
+      "[usage] failed to reserve %s x%s for %s:",
+      metric,
+      amount,
+      ctx.shop,
+      err?.message
+    );
+    // Fail OPEN, same as usedSoFar. A database blip must not block work a
+    // merchant has paid for; briefly under-counting is the cheaper failure.
+    return { allowed: true, limit, used: 0, remaining: limit };
+  }
+
+  if (limit !== UNLIMITED && after > limit) {
+    await refundUsage(ctx.shop, metric, amount);
+    const used = Math.max(0, after - amount);
+    return { allowed: false, limit, used, remaining: Math.max(0, limit - used) };
+  }
+
+  return { allowed: true, limit, used: after, remaining: Math.max(0, limit - after) };
+}
+
+/** Give back a reservation that went unused. */
+export async function refundUsage(shop, metric, amount = 1) {
+  if (!amount || amount < 1) return;
+  try {
+    await prisma.usageCounter.update({
+      where: { shop_metric_period: { shop, metric, period: currentPeriod() } },
+      data: { count: { decrement: amount } },
+    });
+  } catch (err) {
+    // Over-counting by the refunded amount is the failure mode here. Logged
+    // rather than retried: the merchant's work already succeeded or failed on
+    // its own terms, and a stuck retry loop would be worse.
+    console.error(
+      "[usage] failed to refund %s x%s for %s:",
+      metric,
+      amount,
+      shop,
+      err?.message
+    );
+  }
 }
 
 /**
