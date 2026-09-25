@@ -135,7 +135,11 @@ async function pageSpeedAttempt(apiUrl) {
 
   // Get metrics
   const lcpAudit = audits['largest-contentful-paint'];
-  const fidAudit = audits['max-potential-fid'] || audits['total-blocking-time'];
+  // Total Blocking Time, not max-potential-FID: FID is retired as a Core Web
+  // Vital and max-potential-FID measures a different thing (the single worst
+  // input delay), so it was never comparable to the 100ms FID threshold the
+  // UI rated it against.
+  const tbtAudit = audits['total-blocking-time'];
   const clsAudit = audits['cumulative-layout-shift'];
   const ttfbAudit = audits['server-response-time'];
   const speedIndexAudit = audits['speed-index'];
@@ -144,7 +148,7 @@ async function pageSpeedAttempt(apiUrl) {
   return {
     score: performanceScore,
     lcp: lcpAudit?.numericValue ? parseFloat((lcpAudit.numericValue / 1000).toFixed(2)) : 0,
-    fid: fidAudit?.numericValue ? Math.round(fidAudit.numericValue) : 0,
+    tbt: tbtAudit?.numericValue ? Math.round(tbtAudit.numericValue) : 0,
     cls: clsAudit?.numericValue ? parseFloat(clsAudit.numericValue.toFixed(3)) : 0,
     ttfb: ttfbAudit?.numericValue ? parseFloat((ttfbAudit.numericValue / 1000).toFixed(2)) : 0,
     loadTime: interactiveAudit?.numericValue ? parseFloat((interactiveAudit.numericValue / 1000).toFixed(2)) : 0,
@@ -416,6 +420,7 @@ export async function action({ request }) {
 
   if (actionType === 'runLighthouseAnalysis') {
     const pageUrl = formData.get('pageUrl');
+    const pageName = formData.get('pageName');
 
     const quota = await quotaContext(admin, session);
     const check = await checkQuota(quota, METRICS.PAGESPEED_REPORTS, 1);
@@ -442,7 +447,9 @@ export async function action({ request }) {
 
       return {
         success: true,
-        message: `PageSpeed analysis completed. Performance Score: ${result.score}/100`,
+        message: `PageSpeed test completed for ${pageName || pageUrl}. Performance Score: ${result.score}/100`,
+        pageUrl,
+        pageName,
         result
       };
     } catch (error) {
@@ -476,61 +483,39 @@ export default function PageSpeedImpactReports() {
   const navigation = useNavigation();
   const actionData = useActionData();
   
-  const [selectedPage, setSelectedPage] = useState(initialSelectedPage);
+  // The selector starts on a real page. There used to be an "All Pages
+  // (Average)" entry that the live test could never run against, so the
+  // default state of this screen was one where the button did nothing.
+  const [selectedPage, setSelectedPage] = useState(
+    initialSelectedPage !== 'all' && pages.some(p => p.id === initialSelectedPage)
+      ? initialSelectedPage
+      : (pages[0]?.id || '')
+  );
   const [showSuccessBanner, setShowSuccessBanner] = useState(false);
-  const [successMessage, setSuccessMessage] = useState('');
-
-  // A live run measures ONE page as it is right now. Track which page it belongs
-  // to so changing the selector can't display one page's real measurement under
-  // another page's name.
-  const [liveResult, setLiveResult] = useState(null);
-  const [liveResultPage, setLiveResultPage] = useState(null);
 
   const isRunningAnalysis = navigation.state === 'submitting';
 
   useEffect(() => {
     if (actionData?.success) {
       setShowSuccessBanner(true);
-      setSuccessMessage(actionData.message);
-      if (actionData.result) {
-        setLiveResult(actionData.result);
-      }
-      setTimeout(() => setShowSuccessBanner(false), 5000);
     }
   }, [actionData]);
 
-  const metrics = [
-    { id: 'lcp', name: 'LCP', label: 'Largest Contentful Paint', unit: 's', goodThreshold: 2.5 },
-    { id: 'fid', name: 'FID', label: 'First Input Delay', unit: 'ms', goodThreshold: 100 },
-    { id: 'cls', name: 'CLS', label: 'Cumulative Layout Shift', unit: '', goodThreshold: 0.1 },
-    { id: 'ttfb', name: 'TTFB', label: 'Time to First Byte', unit: 's', goodThreshold: 0.8 }
-  ];
-
+  // Changing the selector is a local choice, not a navigation: the loader has
+  // every page already, so re-submitting a GET only threw away the result the
+  // merchant just waited 30-60s for.
   const handlePageChange = useCallback((value) => {
     setSelectedPage(value);
-    // A measurement belongs to the page it was run against — drop it rather than
-    // let it linger over a different page's numbers.
-    setLiveResult(null);
-    setLiveResultPage(null);
-    submit({ page: value }, { method: 'get' });
-  }, [submit]);
+  }, []);
 
   const handleRunLighthouse = useCallback(() => {
-    if (selectedPage === 'all') {
-      return; // Can't run test on "all pages"
-    }
-
     const currentPage = pages.find(p => p.id === selectedPage);
     if (!currentPage || !currentPage.published) return;
-
-    // Stamp the target before submitting, so the result that comes back is
-    // attributed to the page that was actually tested.
-    setLiveResult(null);
-    setLiveResultPage(selectedPage);
 
     const formData = new FormData();
     formData.append('actionType', 'runLighthouseAnalysis');
     formData.append('pageUrl', currentPage.fullUrl);
+    formData.append('pageName', currentPage.name);
     submit(formData, { method: 'post' });
   }, [selectedPage, pages, submit]);
 
@@ -546,17 +531,26 @@ export default function PageSpeedImpactReports() {
     return 'Poor';
   };
 
-  // Only show a measurement against the page it was taken on.
-  const showLive = Boolean(liveResult) && liveResultPage === selectedPage;
-
-  const currentPageMeta = selectedPage === 'all' ? null : pages.find(p => p.id === selectedPage);
+  const currentPageMeta = pages.find(p => p.id === selectedPage) || null;
   // Google can only load a page that's actually published to the Online Store.
   const canRunLive = Boolean(currentPageMeta?.published);
 
-  const pageOptions = [
-    { label: 'All Pages (Average)', value: 'all' },
-    ...pages.map(page => ({ label: page.name || page.url, value: page.id }))
-  ];
+  const pageOptions = pages.map(page => ({ label: page.name || page.url, value: page.id }));
+
+  // The measurement comes straight from the action result, so it belongs to the
+  // page that was tested by construction — it cannot end up displayed under a
+  // different page's name.
+  const liveResult = actionData?.success ? actionData.result : null;
+
+  const liveMetricRows = liveResult ? [
+    ['Performance Score', `${liveResult.score}/100`, getScoreLabel(liveResult.score)],
+    ['Largest Contentful Paint (LCP)', `${liveResult.lcp}s`, liveResult.lcp <= 2.5 ? 'Good' : liveResult.lcp <= 4 ? 'Needs Improvement' : 'Poor'],
+    ['Total Blocking Time (TBT)', `${liveResult.tbt}ms`, liveResult.tbt <= 200 ? 'Good' : liveResult.tbt <= 600 ? 'Needs Improvement' : 'Poor'],
+    ['Cumulative Layout Shift (CLS)', `${liveResult.cls}`, liveResult.cls <= 0.1 ? 'Good' : liveResult.cls <= 0.25 ? 'Needs Improvement' : 'Poor'],
+    ['Time to First Byte (TTFB)', `${liveResult.ttfb}s`, liveResult.ttfb <= 0.8 ? 'Good' : 'Needs Improvement'],
+    ['Speed Index', `${liveResult.speedIndex}s`, liveResult.speedIndex <= 3.4 ? 'Good' : liveResult.speedIndex <= 5.8 ? 'Needs Improvement' : 'Poor'],
+    ['Time to Interactive', `${liveResult.loadTime}s`, liveResult.loadTime <= 3.8 ? 'Good' : liveResult.loadTime <= 7.3 ? 'Needs Improvement' : 'Poor']
+  ] : [];
 
   const getInsightBadge = (impact, status) => {
     if (status === 'completed') return <Badge tone="success">Completed</Badge>;
@@ -598,19 +592,6 @@ export default function PageSpeedImpactReports() {
     <Page
       title="Page Speed Impact Analysis"
       subtitle="Measured image savings from your optimization runs, plus live PageSpeed tests"
-      primaryAction={
-        selectedPage !== 'all' && pages.length > 0
-          ? {
-              content: isRunningAnalysis ? 'Running Analysis...' : 'Run Live PageSpeed Test',
-              onAction: handleRunLighthouse,
-              loading: isRunningAnalysis,
-              // Disabled rather than hidden when the product isn't published —
-              // the banner below explains why, which beats a button that
-              // silently burns one of the plan's monthly reports on a 404.
-              disabled: isRunningAnalysis || !canRunLive
-            }
-          : undefined
-      }
     >
       <Layout>
         {loadError && (
@@ -621,17 +602,9 @@ export default function PageSpeedImpactReports() {
           </Layout.Section>
         )}
 
-        {showSuccessBanner && actionData?.success && (
-          <Layout.Section>
-            <Banner title="Analysis Complete" tone="success" onDismiss={() => setShowSuccessBanner(false)}>
-              {successMessage}
-            </Banner>
-          </Layout.Section>
-        )}
-
         {actionData?.error && (
           <Layout.Section>
-            <Banner title="Error" tone="critical">
+            <Banner title="Live test couldn't complete" tone="warning">
               {actionData.error}
             </Banner>
           </Layout.Section>
@@ -658,22 +631,48 @@ export default function PageSpeedImpactReports() {
           </Banner>
         </Layout.Section>
 
-        {/* Page Selector */}
+        {/* Live PageSpeed Test */}
         <Layout.Section>
           <Card>
-            <InlineStack align="space-between" blockAlign="center" wrap={true}>
-              <Box minWidth="300px">
-                <Select 
-                  label="Select Page" 
-                  options={pageOptions} 
-                  value={selectedPage} 
-                  onChange={handlePageChange} 
-                />
-              </Box>
-              <Text variant="bodySm" as="p" tone="subdued">
-                Pick a page to run a live test on it
+            <BlockStack gap="400">
+              <Text variant="headingMd" as="h3">Live PageSpeed Test</Text>
+              <Text variant="bodyMd" as="p">
+                Run a real Lighthouse test via Google PageSpeed Insights to measure the current performance of a product page.
+                This is actual measured data for your store, not an estimate.
               </Text>
-            </InlineStack>
+              {pages.length > 0 ? (
+                <InlineStack gap="400" blockAlign="end" wrap={true}>
+                  <Box minWidth="300px">
+                    <Select
+                      label="Select Page"
+                      options={pageOptions}
+                      value={selectedPage}
+                      onChange={handlePageChange}
+                    />
+                  </Box>
+                  <Button
+                    variant="primary"
+                    onClick={handleRunLighthouse}
+                    loading={isRunningAnalysis}
+                    // Disabled rather than hidden when the product isn't published —
+                    // the banner below explains why, which beats a button that
+                    // silently burns one of the plan's monthly reports on a 404.
+                    disabled={isRunningAnalysis || !selectedPage || !canRunLive}
+                  >
+                    {isRunningAnalysis ? 'Running test…' : 'Run Live PageSpeed Test'}
+                  </Button>
+                </InlineStack>
+              ) : (
+                <Text variant="bodyMd" as="p" tone="subdued">
+                  Optimize at least one product page first, then come back here to measure its performance.
+                </Text>
+              )}
+              <Text variant="bodySm" as="p" tone="subdued">
+                Tests run against the live page on Google's servers and may take 30–60 seconds, and count against
+                your plan's monthly PageSpeed reports. Rate limits apply. Tip: run a test before and after
+                optimizing a page to see the measured difference.
+              </Text>
+            </BlockStack>
           </Card>
         </Layout.Section>
 
@@ -690,42 +689,27 @@ export default function PageSpeedImpactReports() {
           </Layout.Section>
         )}
 
-        {/* Measured result — the only Lighthouse numbers on this page */}
-        {showLive && (
+        {/* Live test results — the only Lighthouse numbers on this page */}
+        {showSuccessBanner && liveResult && (
           <Layout.Section>
             <Card>
               <BlockStack gap="400">
                 <InlineStack align="space-between" blockAlign="center" wrap={true}>
-                  <Text variant="headingMd" as="h3">Measured Performance</Text>
-                  <Badge tone="success">Live from Google PageSpeed Insights</Badge>
+                  <Text variant="headingMd" as="h3">
+                    {`Measured Results — ${actionData.pageName || actionData.pageUrl}`}
+                  </Text>
+                  <Badge tone={getScoreTone(liveResult.score)}>
+                    {`Score: ${liveResult.score}/100 (${getScoreLabel(liveResult.score)})`}
+                  </Badge>
                 </InlineStack>
+                <DataTable
+                  columnContentTypes={['text', 'text', 'text']}
+                  headings={['Metric', 'Measured Value', 'Rating']}
+                  rows={liveMetricRows}
+                />
                 <Text variant="bodySm" as="p" tone="subdued">
-                  Measured on this page as it is right now, by Google.
+                  {`Source: Google PageSpeed Insights (Lighthouse, mobile). Tested at ${new Date(liveResult.timestamp).toLocaleString()}.`}
                 </Text>
-                <InlineStack gap="600" wrap={true} blockAlign="start">
-                  <BlockStack gap="100" inlineAlign="center">
-                    <Text variant="bodySm" as="p" tone="subdued">Performance score</Text>
-                    <Text variant="heading3xl" as="p" tone={getScoreTone(liveResult.score)}>
-                      {liveResult.score}
-                    </Text>
-                    <Text variant="bodySm" as="p" tone="subdued">{getScoreLabel(liveResult.score)}</Text>
-                  </BlockStack>
-                  {metrics.map(metric => (
-                    <BlockStack key={`live-${metric.id}`} gap="100" inlineAlign="center">
-                      <Text variant="bodySm" as="p" tone="subdued">{metric.name}</Text>
-                      <Text variant="headingLg" as="p">
-                        {liveResult[metric.id]}{metric.unit}
-                      </Text>
-                      <Text
-                        variant="bodySm"
-                        as="p"
-                        tone={liveResult[metric.id] <= metric.goodThreshold ? 'success' : 'subdued'}
-                      >
-                        {liveResult[metric.id] <= metric.goodThreshold ? 'Good' : 'Needs work'}
-                      </Text>
-                    </BlockStack>
-                  ))}
-                </InlineStack>
               </BlockStack>
             </Card>
           </Layout.Section>
@@ -738,7 +722,7 @@ export default function PageSpeedImpactReports() {
               <BlockStack gap="400">
                 <BlockStack gap="100">
                   <InlineStack align="space-between" blockAlign="center">
-                    <Text variant="headingMd" as="h3">Optimized Pages — Measured Savings</Text>
+                    <Text variant="headingMd" as="h3">Measured Image Savings by Page</Text>
                     {pages.length > 20 && (
                       <Badge tone="info">{`Showing first 20 of ${pages.length} pages`}</Badge>
                     )}
@@ -778,27 +762,6 @@ export default function PageSpeedImpactReports() {
           </Card>
         </Layout.Section>
 
-        {/* Live Testing Info */}
-        {pages.length > 0 && (
-          <Layout.Section>
-            <Card>
-              <BlockStack gap="300">
-                <Text variant="headingMd" as="h3">Live Performance Testing</Text>
-                <Text variant="bodyMd" as="p">
-                  Select a specific page above and click "Run Live PageSpeed Test" to measure it with
-                  Google PageSpeed Insights. The result appears at the top of this page and is the only
-                  place a performance score is shown. The test isn't available for "All Pages (Average)"
-                  — Google measures one URL at a time.
-                </Text>
-                <Text variant="bodySm" as="p" tone="subdued">
-                  A test takes 30-60 seconds and counts against your plan's monthly PageSpeed reports.
-                  Google must be able to reach the page publicly, so a password-protected storefront or an
-                  unpublished product will fail. Rate limits apply (roughly 1-2 requests per minute).
-                </Text>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-        )}
       </Layout>
     </Page>
   );
