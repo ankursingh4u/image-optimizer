@@ -80,61 +80,109 @@ async function getAllProductHandles(admin) {
  * Run Lighthouse performance test using PageSpeed Insights API
  * This is more reliable than running Chrome headless on a server
  */
-async function runPageSpeedTest(url) {
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One PSI attempt. Throws { retryable } so the caller can decide to retry.
+async function pageSpeedAttempt(apiUrl) {
+  const controller = new AbortController();
+  // A Lighthouse run takes 30-60s and the request has no deadline of its own,
+  // so without this the action can hang until the platform kills it and the
+  // merchant is left watching "Running Analysis..." forever.
+  const timer = setTimeout(() => controller.abort(), 45000);
+  let response;
   try {
-    // Use Google PageSpeed Insights API with API key for higher rate limits.
-    // Key is provided via environment variable only (never hardcoded).
-    const apiKey = process.env.GOOGLE_PAGESPEED_API_KEY;
-    const keyParam = apiKey ? `&key=${apiKey}` : '';
-    const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&category=performance&strategy=mobile${keyParam}`;
-    
-    console.log('Running PageSpeed test for:', url);
-    
-    const response = await fetch(apiUrl);
-    if (!response.ok) {
-      // Include Google's own status and reason. The previous bare message hid
-      // WHY every call failed, which let a malformed storefront URL look
-      // identical to a rate limit in the logs.
-      const body = await response.text().catch(() => '');
-      throw new Error(`PageSpeed API ${response.status} for ${url}: ${body.slice(0, 300)}`);
-    }
-
-    const data = await response.json();
-    const lighthouseResult = data.lighthouseResult;
-    
-    if (!lighthouseResult) {
-      throw new Error('No Lighthouse data in response');
-    }
-
-    // Extract performance score
-    const performanceScore = Math.round((lighthouseResult.categories.performance?.score || 0) * 100);
-    
-    // Extract Core Web Vitals from audits
-    const audits = lighthouseResult.audits;
-    
-    // Get metrics
-    const lcpAudit = audits['largest-contentful-paint'];
-    const fidAudit = audits['max-potential-fid'] || audits['total-blocking-time'];
-    const clsAudit = audits['cumulative-layout-shift'];
-    const ttfbAudit = audits['server-response-time'];
-    const speedIndexAudit = audits['speed-index'];
-    const interactiveAudit = audits['interactive'];
-    
-    return {
-      score: performanceScore,
-      lcp: lcpAudit?.numericValue ? parseFloat((lcpAudit.numericValue / 1000).toFixed(2)) : 0,
-      fid: fidAudit?.numericValue ? Math.round(fidAudit.numericValue) : 0,
-      cls: clsAudit?.numericValue ? parseFloat(clsAudit.numericValue.toFixed(3)) : 0,
-      ttfb: ttfbAudit?.numericValue ? parseFloat((ttfbAudit.numericValue / 1000).toFixed(2)) : 0,
-      loadTime: interactiveAudit?.numericValue ? parseFloat((interactiveAudit.numericValue / 1000).toFixed(2)) : 0,
-      speedIndex: speedIndexAudit?.numericValue ? parseFloat((speedIndexAudit.numericValue / 1000).toFixed(2)) : 0,
-      timestamp: new Date().toISOString()
-    };
-
-  } catch (error) {
-    console.error('PageSpeed test error:', error);
-    return null;
+    response = await fetch(apiUrl, { signal: controller.signal });
+  } catch (e) {
+    // Network error or our 45s abort — transient, worth retrying.
+    const err = new Error(
+      e?.name === 'AbortError'
+        ? 'PageSpeed request timed out'
+        : `PageSpeed network error: ${e?.message || e}`
+    );
+    err.retryable = true;
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
+
+  if (!response.ok) {
+    // Include Google's own status and reason. A bare message hides WHY every
+    // call failed, which lets a malformed storefront URL look identical to a
+    // rate limit in the logs.
+    let detail = '';
+    try { detail = (await response.json())?.error?.message || ''; } catch { /* non-JSON */ }
+    const err = new Error(`PageSpeed API request failed (${response.status})${detail ? `: ${detail}` : ''}`);
+    // 429 (rate limit) and 5xx are transient; other 4xx (bad/unreachable URL) are not.
+    err.retryable = response.status === 429 || response.status >= 500;
+    throw err;
+  }
+
+  const data = await response.json();
+  const lighthouseResult = data.lighthouseResult;
+  if (!lighthouseResult) {
+    // Sometimes PSI returns 200 with a lighthouse runtime error (e.g. page slow
+    // to load) — treat as retryable, a re-run often succeeds.
+    const err = new Error('No Lighthouse data in response');
+    err.retryable = true;
+    throw err;
+  }
+
+  // Extract performance score
+  const performanceScore = Math.round((lighthouseResult.categories.performance?.score || 0) * 100);
+
+  // Extract Core Web Vitals from audits
+  const audits = lighthouseResult.audits;
+
+  // Get metrics
+  const lcpAudit = audits['largest-contentful-paint'];
+  const fidAudit = audits['max-potential-fid'] || audits['total-blocking-time'];
+  const clsAudit = audits['cumulative-layout-shift'];
+  const ttfbAudit = audits['server-response-time'];
+  const speedIndexAudit = audits['speed-index'];
+  const interactiveAudit = audits['interactive'];
+
+  return {
+    score: performanceScore,
+    lcp: lcpAudit?.numericValue ? parseFloat((lcpAudit.numericValue / 1000).toFixed(2)) : 0,
+    fid: fidAudit?.numericValue ? Math.round(fidAudit.numericValue) : 0,
+    cls: clsAudit?.numericValue ? parseFloat(clsAudit.numericValue.toFixed(3)) : 0,
+    ttfb: ttfbAudit?.numericValue ? parseFloat((ttfbAudit.numericValue / 1000).toFixed(2)) : 0,
+    loadTime: interactiveAudit?.numericValue ? parseFloat((interactiveAudit.numericValue / 1000).toFixed(2)) : 0,
+    speedIndex: speedIndexAudit?.numericValue ? parseFloat((speedIndexAudit.numericValue / 1000).toFixed(2)) : 0,
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * Run a real Lighthouse performance test via Google PageSpeed Insights.
+ * The keyless endpoint is rate-limited to roughly 1-2 requests a minute, so a
+ * single attempt fails far more often than the storefront is actually broken —
+ * we retry with backoff (up to 3 attempts) on 429/5xx/timeout. A bad or
+ * unreachable URL is not retried, because re-running it cannot help. Returns
+ * null only after every attempt has failed.
+ */
+async function runPageSpeedTest(url) {
+  const apiKey = process.env.GOOGLE_PAGESPEED_API_KEY;
+  const keyParam = apiKey ? `&key=${apiKey}` : '';
+  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&category=performance&strategy=mobile${keyParam}`;
+
+  console.log('Running PageSpeed test for:', url);
+
+  const backoffs = [0, 2000, 5000]; // before attempts 1, 2, 3
+  let lastErr;
+  for (let attempt = 0; attempt < backoffs.length; attempt++) {
+    if (backoffs[attempt]) await sleep(backoffs[attempt]);
+    try {
+      return await pageSpeedAttempt(apiUrl);
+    } catch (e) {
+      lastErr = e;
+      console.error(`PageSpeed attempt ${attempt + 1} failed for ${url}:`, e?.message || e);
+      if (!e?.retryable) break; // bad/unreachable URL — retrying won't help
+    }
+  }
+  console.error('PageSpeed test failed after retries:', lastErr?.message || lastErr);
+  return null;
 }
 
 /**

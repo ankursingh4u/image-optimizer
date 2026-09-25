@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { useLoaderData, useRevalidator } from 'react-router';
+import { useLoaderData, useFetcher } from 'react-router';
 import { authenticate } from '../shopify.server';
 import { quotaContext } from '../usage.server';
-import { getImageFormat, optimizeWholeProduct } from '../optimize.server';
+import { optimizeWholeProduct } from '../optimize.server';
 import {
   Page,
   Layout,
@@ -23,388 +23,18 @@ import {
   EmptyState
 } from '@shopify/polaris';
 
-/**
- * Fetch all products with pagination
- */
-async function fetchAllProducts(admin, cursor = null) {
-  const query = `#graphql
-    query GetProductsWithImages($cursor: String) {
-      products(first: 50, after: $cursor) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        edges {
-          node {
-            id
-            title
-            handle
-            status
-            featuredImage {
-              id
-              url
-              altText
-              width
-              height
-            }
-            media(first: 250) {
-              edges {
-                node {
-                  mediaContentType
-                  ... on MediaImage {
-                    id
-                    alt
-                    image {
-                      url
-                      width
-                      height
-                    }
-                  }
-                }
-              }
-            }
-            metafields(first: 20, namespace: "image_optimization") {
-              edges {
-                node {
-                  key
-                  value
-                  createdAt
-                  updatedAt
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  `;
-
-  const response = await admin.graphql(query, {
-    variables: { cursor }
-  });
-
-  return await response.json();
-}
-
-async function getAllProducts(admin) {
-  let allProducts = [];
-  let hasNextPage = true;
-  let cursor = null;
-
-  while (hasNextPage) {
-    const data = await fetchAllProducts(admin, cursor);
-    const products = data.data.products.edges.map(edge => edge.node);
-    // Normalize the media connection into the { images: { edges } } shape the
-    // rest of this file expects. We use MediaImage ids here so they match the
-    // ids we write optimization metafields against during the action.
-    for (const p of products) {
-      const mediaNodes = (p.media?.edges || [])
-        .map(e => e.node)
-        .filter(n => n && n.mediaContentType === 'IMAGE' && n.image && n.image.url);
-      p.images = {
-        edges: mediaNodes.map(n => ({
-          node: {
-            id: n.id,
-            url: n.image.url,
-            altText: n.alt || '',
-            width: n.image.width,
-            height: n.image.height,
-          },
-        })),
-      };
-      delete p.media;
-    }
-    allProducts = [...allProducts, ...products];
-
-    hasNextPage = data.data.products.pageInfo.hasNextPage;
-    cursor = data.data.products.pageInfo.endCursor;
-  }
-
-  return allProducts;
-}
-
-/**
- * Estimate an image's file size (MB) from its pixel dimensions and format.
- * Instant and requires no network request — used for images that haven't been
- * optimized yet so the UI shows a real number instead of 0.
- */
-function estimateImageSize(width, height, format = 'jpg') {
-  if (!width || !height) return 0;
-  const pixels = width * height;
-  const bytesPerPixel = 3;
-  const uncompressedBytes = pixels * bytesPerPixel;
-  const compressionRatios = { jpg: 0.1, jpeg: 0.1, png: 0.3, webp: 0.05, gif: 0.2 };
-  const ratio = compressionRatios[String(format).toLowerCase()] || 0.15;
-  return (uncompressedBytes * ratio) / (1024 * 1024);
-}
-
-/**
- * Calculate optimization score for a product
- */
-function calculateOptimizationScore(product) {
-  let score = 0;
-  const images = product.images.edges.map(edge => edge.node);
-  
-  const imageCount = images.length;
-  if (imageCount > 0) {
-    score += Math.min(imageCount * 2, 20);
-  }
-
-  const imagesWithAlt = images.filter(img => img.altText && img.altText.length > 10);
-  const altTextScore = (imagesWithAlt.length / Math.max(imageCount, 1)) * 30;
-  score += altTextScore;
-
-  const optimizedImages = product.metafields.edges.filter(
-    mf => mf.node.key.startsWith('image_')
-  ).length;
-  const optimizationScore = (optimizedImages / Math.max(imageCount, 1)) * 40;
-  score += optimizationScore;
-
-  if (product.featuredImage && product.featuredImage.altText) {
-    score += 10;
-  }
-
-  return {
-    score: Math.round(score),
-    imageCount,
-    imagesWithAlt: imagesWithAlt.length,
-    optimizedImages,
-    hasFeaturedImage: !!product.featuredImage
-  };
-}
-
 export async function loader({ request }) {
-  const { admin } = await authenticate.admin(request);
+  await authenticate.admin(request);
   const url = new URL(request.url);
   const filter = url.searchParams.get('filter') || 'all';
   const sortBy = url.searchParams.get('sortBy') || 'score_asc';
 
-  try {
-    const products = await getAllProducts(admin);
-
-    const processedProducts = products.map((product) => {
-        const images = product.images.edges.map(edge => edge.node);
-        const imageCount = images.length;
-        const optimizationData = calculateOptimizationScore(product);
-
-        // Parse the per-image optimization records, indexed by the media id of the
-        // image they produced (that id is the metafield key suffix). Keeping the
-        // FULL record lets us walk an image's re-optimization history.
-        const recByOutId = {}; // shortMediaId -> full record object
-        for (const mf of product.metafields.edges) {
-          if (!mf.node.key.startsWith('image_')) continue;
-          try {
-            recByOutId[mf.node.key.slice('image_'.length)] = JSON.parse(mf.node.value);
-          } catch (e) {}
-        }
-        let summary = null;
-        const summaryMf = product.metafields.edges.find(mf => mf.node.key === 'optimization_summary');
-        if (summaryMf) { try { summary = JSON.parse(summaryMf.node.value); } catch (e) {} }
-
-        // For a current image, resolve its CURRENT optimized size and its TRUE
-        // original size by walking back through re-optimization records. When an
-        // image is optimized more than once, the newest record's "original" is the
-        // already-small size; the true original lives in an older record in the
-        // chain (linked via originalImageId). We take the largest original seen.
-        const resolveImage = (shortId) => {
-          const rec = recByOutId[shortId];
-          if (!rec) return null;
-          const optimized = Number(rec.optimizedSizeMB) || 0;
-          let trueOriginal = Number(rec.originalSizeMB) || 0;
-          let cursor = rec;
-          let guard = 0;
-          while (cursor && cursor.originalImageId && guard++ < 25) {
-            const pid = String(cursor.originalImageId).split('/').pop();
-            const prev = recByOutId[pid];
-            if (!prev || prev === cursor) break;
-            trueOriginal = Math.max(trueOriginal, Number(prev.originalSizeMB) || 0);
-            cursor = prev;
-          }
-          return { original: trueOriginal, optimized };
-        };
-
-        // Resolve the REAL optimized totals with a priority chain so savings never
-        // silently collapse to 0. We deliberately do NOT download images here —
-        // doing that on every page load is what made this screen extremely slow.
-        let optimizedCount = 0;
-        let storedOriginal = 0;
-        let storedOptimized = 0;
-
-        // Priority 1: per-image records that match a CURRENT media id (precise),
-        // resolved through their full re-optimization history.
-        let matched = 0;
-        for (const image of images) {
-          const r = resolveImage(image.id.split('/').pop());
-          if (r && (r.original > 0 || r.optimized > 0)) {
-            storedOriginal += r.original;
-            storedOptimized += r.optimized;
-            matched++;
-          }
-        }
-        if (matched > 0) {
-          optimizedCount = matched;
-        } else if (summary && (Number(summary.totalOriginalSizeMB) > 0 || (summary.optimizedImages || 0) > 0)) {
-          // Priority 2: product-level summary (id-independent, no double counting).
-          optimizedCount = summary.optimizedImages || 0;
-          storedOriginal = Number(summary.totalOriginalSizeMB) || 0;
-          storedOptimized = Number(summary.totalOptimizedSizeMB) || 0;
-          if (!storedOptimized && summary.totalSizeSavedMB != null && storedOriginal) {
-            storedOptimized = storedOriginal - Number(summary.totalSizeSavedMB);
-          }
-        } else {
-          // Priority 3: no current-id match and no summary — use the single largest
-          // recorded original vs its optimized size so a historical optimization
-          // (keyed by an older id scheme) still surfaces instead of showing 0.
-          for (const rec of Object.values(recByOutId)) {
-            const o = Number(rec.originalSizeMB) || 0;
-            const c = Number(rec.optimizedSizeMB) || 0;
-            if (o > 0 || c > 0) {
-              storedOriginal += o;
-              storedOptimized += c;
-              optimizedCount++;
-            }
-          }
-        }
-
-        optimizedCount = Math.min(optimizedCount, imageCount);
-
-        // Safety net for single-image products: every record belongs to that one
-        // image's history, so the true original is simply the largest original ever
-        // recorded. Recovers the real size even when re-optimization records don't
-        // link back via originalImageId.
-        if (imageCount === 1 && matched === 1) {
-          let maxOrig = 0;
-          for (const rec of Object.values(recByOutId)) {
-            maxOrig = Math.max(maxOrig, Number(rec.originalSizeMB) || 0);
-          }
-          if (maxOrig > storedOriginal) storedOriginal = maxOrig;
-        }
-
-        // Estimate the size of images that have NOT been optimized yet (instant,
-        // no network) so un-optimized products still show a real number and a
-        // potential-savings figure. Treat the largest current images as the
-        // not-yet-optimized ones.
-        const unoptimizedCount = Math.max(imageCount - optimizedCount, 0);
-        let estUnoptimized = 0;
-        if (unoptimizedCount > 0) {
-          const ests = images
-            .map(img => estimateImageSize(img.width, img.height, getImageFormat(img.url)))
-            .sort((a, b) => b - a);
-          estUnoptimized = ests.slice(0, unoptimizedCount).reduce((s, v) => s + v, 0);
-        }
-
-        const totalOptimizedSize = storedOptimized + estUnoptimized; // current actual/estimated size
-        const measuredSaved = Math.max(storedOriginal - storedOptimized, 0);
-
-        // The current (post-optimization) total size of the product's images.
-        const currentSizeMB = totalOptimizedSize;
-
-        // Estimated un-optimized ORIGINAL size from the image dimensions (baseline
-        // = lightly-compressed PNG). Used when we have no measured original to show
-        // so every product still displays a believable Original + Size Reduced.
-        let estOriginalMB = 0;
-        for (const img of images) {
-          estOriginalMB += estimateImageSize(img.width, img.height, 'png');
-        }
-        // Ensure the estimated original is meaningfully larger than the current
-        // size (typical optimization keeps ~30% of an unoptimized upload).
-        if (estOriginalMB < currentSizeMB * 1.4) estOriginalMB = currentSizeMB / 0.3;
-        const estReducedMB = Math.max(estOriginalMB - currentSizeMB, 0);
-
-        // Prefer REAL measured numbers when the app actually compressed a larger
-        // image; otherwise fall back to the estimate — but ONLY for products the
-        // app has actually optimized. Un-optimized products must NOT show a
-        // reduction (they show current size + potential savings instead).
-        const isOptimizedProduct = optimizedCount > 0;
-        const hasReal = measuredSaved >= 0.01;
-        const displayOriginalMB = hasReal ? (storedOriginal + estUnoptimized) : estOriginalMB;
-        const displayReducedMB = hasReal
-          ? measuredSaved
-          : (isOptimizedProduct ? estReducedMB : 0);
-        const displayRate = (isOptimizedProduct && displayOriginalMB > 0)
-          ? Math.round((displayReducedMB / displayOriginalMB) * 100)
-          : 0;
-
-        const totalOriginalSize = displayOriginalMB;
-        const sizeSaved = displayReducedMB;
-
-        // Estimated size reduction vs a typical UN-optimized upload of the same
-        // dimensions. Baseline = standard JPEG weight; target = optimized WebP
-        // weight. This powers the store-wide "estimated savings" metric so the
-        // dashboard shows the value of keeping images optimized even when no
-        // further measured reduction is available.
-        let estBaseline = 0;
-        let estTarget = 0;
-        for (const img of images) {
-          estBaseline += estimateImageSize(img.width, img.height, 'jpg');
-          estTarget += estimateImageSize(img.width, img.height, 'webp');
-        }
-        const estimatedSavingsMB = Math.max(estBaseline - estTarget, 0);
-
-        return {
-          id: product.id,
-          title: product.title,
-          handle: product.handle,
-          status: product.status,
-          imageCount,
-          ...optimizationData,
-          optimizedImages: optimizedCount,
-          // Whether the app has optimized this product at all (has records).
-          isOptimized: optimizedCount > 0,
-          // Whether the shown Original/Reduced are estimated (no measured original)
-          // or measured (the app actually compressed a larger image).
-          isEstimate: !hasReal,
-          totalOriginalSizeMB: totalOriginalSize,
-          totalOptimizedSizeMB: totalOptimizedSize,
-          sizeSavedMB: sizeSaved,
-          potentialSavingsMB: estUnoptimized * 0.68,
-          estimatedSavingsMB,
-          compressionRate: displayRate,
-          featuredImageUrl: product.featuredImage?.url || images[0]?.url,
-          needsOptimization: optimizationData.score < 70
-        };
-    });
-
-    // Return the FULL list. Filtering and sorting now happen client-side for
-    // instant response (no server round-trip when the merchant changes them).
-    // Default order: lowest optimization score first.
-    processedProducts.sort((a, b) => a.score - b.score);
-
-    return {
-      products: processedProducts,
-      filter,
-      sortBy,
-      stats: {
-        total: processedProducts.length,
-        needsOptimization: processedProducts.filter(p => p.needsOptimization).length,
-        optimized: processedProducts.filter(p => !p.needsOptimization).length,
-        totalImages: processedProducts.reduce((sum, p) => sum + p.imageCount, 0),
-        totalSizeMB: processedProducts.reduce((sum, p) => sum + p.totalOriginalSizeMB, 0),
-        potentialSavingsMB: processedProducts.reduce((sum, p) => sum + p.sizeSavedMB, 0),
-        estimatedSavingsMB: processedProducts.reduce((sum, p) => sum + (p.estimatedSavingsMB || 0), 0),
-        optimizedImagesCount: processedProducts.reduce((sum, p) => sum + (p.optimizedImages || 0), 0)
-      },
-      error: null
-    };
-  } catch (error) {
-    console.error('Error loading products:', error);
-    return {
-      products: [],
-      filter,
-      sortBy,
-      stats: {
-        total: 0,
-        needsOptimization: 0,
-        optimized: 0,
-        totalImages: 0,
-        totalSizeMB: 0,
-        potentialSavingsMB: 0,
-        estimatedSavingsMB: 0,
-        optimizedImagesCount: 0
-      },
-      error: 'Failed to load products'
-    };
-  }
+  // Everything in here has to be fast, because the browser cannot finish the
+  // navigation until this returns — which is exactly why opening the optimizer
+  // used to sit there doing nothing while the whole product catalog was built.
+  // The catalog moved to /api/catalog (app/catalog.server.js) and is requested
+  // once this page has already painted.
+  return { filter, sortBy };
 }
 
 /**
@@ -466,15 +96,48 @@ async function pooled(items, limit, worker, shouldStop) {
   await Promise.all(runners);
 }
 
-export default function ProductOptimization() {
-  const { products: initialProducts, filter: initialFilter, sortBy: initialSortBy, stats, error: loadError } = useLoaderData();
-  const revalidator = useRevalidator();
+// Shown until /api/catalog answers. Declared here rather than imported from
+// catalog.server.js so no server module is referenced from client code.
+const EMPTY_STATS = {
+  total: 0,
+  needsOptimization: 0,
+  optimized: 0,
+  totalImages: 0,
+  totalSizeMB: 0,
+  potentialSavingsMB: 0,
+  estimatedSavingsMB: 0,
+  optimizedImagesCount: 0,
+};
 
-  const [products, setProducts] = useState(initialProducts);
+export default function ProductOptimization() {
+  const { filter: initialFilter, sortBy: initialSortBy } = useLoaderData();
+
+  // The product list is fetched AFTER this page renders. Building it takes
+  // seconds (a Shopify request per 50 products, each with up to 250 media
+  // nodes), and while it sat in the loader the browser could not finish the
+  // navigation — opening the optimizer appeared to do nothing.
+  const catalogFetcher = useFetcher();
+  useEffect(() => {
+    if (catalogFetcher.state === 'idle' && !catalogFetcher.data) {
+      catalogFetcher.load('/api/catalog');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogFetcher.state, catalogFetcher.data]);
+
+  // Memoized so the empty placeholder keeps a stable identity — several
+  // callbacks and memos take `products` as a dependency.
+  const products = useMemo(() => catalogFetcher.data?.products ?? [], [catalogFetcher.data]);
+  const stats = catalogFetcher.data?.stats ?? EMPTY_STATS;
+  const catalogLoading = !catalogFetcher.data;
+  const refreshCatalog = useCallback(() => {
+    catalogFetcher.load('/api/catalog');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogFetcher]);
+
   const [filter, setFilter] = useState(initialFilter);
   const [sortBy, setSortBy] = useState(initialSortBy);
   const [selectedProducts, setSelectedProducts] = useState([]);
-  const [error, setError] = useState(loadError);
+  const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
 
   /**
@@ -502,7 +165,7 @@ export default function ProductOptimization() {
   }, []);
 
   const isRunning = run !== null;
-  const isBusy = isRunning || revalidator.state !== 'idle';
+  const isBusy = isRunning || catalogFetcher.state !== 'idle';
 
   const activeId = run ? run.productIds[run.productIndex] : null;
 
@@ -514,11 +177,10 @@ export default function ProductOptimization() {
     ? run.images.filter((img) => img.status !== 'pending' && img.status !== 'working').length
     : 0;
 
-  // Keep local products in sync when the loader revalidates (e.g. after an
-  // optimization reload).
+  // buildCatalog reports failure as data, not a rejection, so surface it here.
   useEffect(() => {
-    setProducts(initialProducts);
-  }, [initialProducts]);
+    if (catalogFetcher.data?.error) setError(catalogFetcher.data.error);
+  }, [catalogFetcher.data]);
 
   // Filtering and sorting are done here, client-side, so they are instant.
   const visibleProducts = useMemo(() => {
@@ -758,9 +420,11 @@ export default function ProductOptimization() {
     }
 
     // One refresh at the end rather than after every image — the numbers only
-    // need to be right when the merchant looks at them again.
-    revalidator.revalidate();
-  }, [products, callApi, publish, revalidator]);
+    // need to be right when the merchant looks at them again. Re-requesting
+    // /api/catalog rather than revalidating the route keeps this to the one
+    // fetch that actually has new data in it.
+    refreshCatalog();
+  }, [products, callApi, publish, refreshCatalog]);
 
   const startRun = useCallback((ids) => {
     if (!ids.length || runRef.current) return;
@@ -774,9 +438,9 @@ export default function ProductOptimization() {
       stopRef.current = false;
       setRun(null);
       setError(err.message || 'The optimization run stopped unexpectedly.');
-      revalidator.revalidate();
+      refreshCatalog();
     });
-  }, [executeRun, revalidator]);
+  }, [executeRun, refreshCatalog]);
 
   const handleStopRun = useCallback(() => {
     stopRef.current = true;
@@ -947,12 +611,14 @@ export default function ProductOptimization() {
           </Layout.Section>
         )}
 
-        {!isRunning && revalidator.state !== 'idle' && (
+        {!isRunning && catalogFetcher.state !== 'idle' && (
           <Layout.Section>
             <Card>
               <InlineStack gap="300" blockAlign="center">
-                <Spinner accessibilityLabel="Refreshing" size="small" />
-                <Text variant="bodyMd" as="p">Refreshing your products…</Text>
+                <Spinner accessibilityLabel={catalogLoading ? 'Loading products' : 'Refreshing'} size="small" />
+                <Text variant="bodyMd" as="p">
+                  {catalogLoading ? 'Loading your products…' : 'Refreshing your products…'}
+                </Text>
               </InlineStack>
             </Card>
           </Layout.Section>
@@ -1062,7 +728,16 @@ export default function ProductOptimization() {
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
-              {visibleProducts.length === 0 ? (
+              {catalogLoading ? (
+                // The catalog arrives after this page paints, so "No products
+                // found" would otherwise be the first thing a merchant reads.
+                <Box padding="600">
+                  <InlineStack gap="300" blockAlign="center" align="center">
+                    <Spinner accessibilityLabel="Loading products" size="small" />
+                    <Text variant="bodyMd" as="p" tone="subdued">Loading your products…</Text>
+                  </InlineStack>
+                </Box>
+              ) : visibleProducts.length === 0 ? (
                 <EmptyState
                   heading="No products found"
                   image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
