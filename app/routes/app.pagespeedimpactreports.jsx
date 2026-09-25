@@ -17,7 +17,6 @@ import {
   Box,
   InlineStack,
   BlockStack,
-  ProgressBar,
   Badge,
   DataTable,
   Banner,
@@ -207,22 +206,18 @@ function calculatePerformanceImprovement(product) {
     const compressionRate = data.avgCompressionRate || 0;
     const optimizedImages = data.optimizedImages || 0;
     
-    // Calculate realistic performance improvements based on research
-    // Studies show that for every 1MB of image size reduction:
-    // - LCP improves by ~0.2-0.3s on 3G/4G
-    // - Load time improves by ~0.3-0.5s
-    // - Performance score improves by ~2-5 points per 10% size reduction
-    
-    const lcpImprovement = Math.min((totalSizeSavedMB * 0.25), 3.0); // Max 3s improvement
-    const loadTimeImprovement = Math.min((totalSizeSavedMB * 0.35), 4.0); // Max 4s improvement
-    const scoreImprovement = Math.min((compressionRate * 0.5), 40); // Max 40 points
-    
+    // Only what was actually measured during the optimization run. The
+    // LCP/load-time/score "improvements" that used to be derived here were
+    // guesses from published benchmarks, and the page presented them as if
+    // they were this store's numbers.
     return {
-      lcpImprovement: parseFloat(lcpImprovement.toFixed(2)),
-      loadTimeImprovement: parseFloat(loadTimeImprovement.toFixed(2)),
-      scoreImprovement: Math.round(scoreImprovement),
       totalSizeSavedMB: parseFloat(totalSizeSavedMB.toFixed(2)),
       totalOriginalSizeMB: parseFloat(totalOriginalSizeMB.toFixed(2)),
+      // Written by the optimizer alongside the original; fall back to the
+      // subtraction for summaries saved before that field existed.
+      totalOptimizedSizeMB: parseFloat(
+        (totalOptimizedSizeMB || Math.max(totalOriginalSizeMB - totalSizeSavedMB, 0)).toFixed(2)
+      ),
       compressionRate,
       optimizedImages
     };
@@ -262,25 +257,17 @@ async function getStorefrontOrigin(admin, shop) {
 }
 
 /**
- * Assumed "before" metrics for a typical e-commerce page.
+ * This page reports only numbers the app actually has.
  *
- * These are FIXED CONSTANTS, not measurements — the same numbers for every page
- * of every store. Nothing here was measured on the merchant's storefront, and
- * nothing derived from them may be presented as a measured result. Any UI built
- * on this must say "projected"/"estimated"; the only real numbers on this page
- * come from runPageSpeedTest(), which calls Google PageSpeed Insights.
+ * It used to invent them: a fixed baseline (score 55, LCP 4.5s, load 6.2s —
+ * the same constants for every page of every store) with a formula-derived
+ * "after" laid over it. Because the score formula capped at +40 and most
+ * products clear the cap, every row read "55 → 95 +40" with near-identical
+ * timings, which is exactly what fabricated data looks like. Bytes saved and
+ * compression are measured from real file sizes and stay; Lighthouse scores
+ * and Core Web Vitals now come only from runPageSpeedTest(), which asks
+ * Google to load the page.
  */
-function getBaselineMetrics() {
-  return {
-    score: 55,
-    lcp: 4.5,
-    fid: 200,
-    cls: 0.20,
-    ttfb: 1.3,
-    loadTime: 6.2,
-    speedIndex: 5.8
-  };
-}
 
 export async function loader({ request }) {
   const { admin, session } = await authenticate.admin(request);
@@ -304,8 +291,6 @@ export async function loader({ request }) {
       const improvement = calculatePerformanceImprovement(product);
       
       if (improvement && improvement.totalSizeSavedMB > 0) {
-        const baseline = getBaselineMetrics();
-        
         pageAnalyses.push({
           id: product.handle,
           url: `/products/${product.handle}`,
@@ -316,57 +301,23 @@ export async function loader({ request }) {
           published: Boolean(product.onlineStoreUrl),
           name: product.title,
           productId: product.id,
-          improvement,
-          before: { ...baseline },
-          after: {
-            score: Math.min(baseline.score + improvement.scoreImprovement, 100),
-            lcp: Math.max(baseline.lcp - improvement.lcpImprovement, 1.0),
-            fid: Math.max(baseline.fid - Math.round(improvement.scoreImprovement * 2), 50),
-            cls: Math.max(baseline.cls - (improvement.compressionRate * 0.001), 0.05),
-            ttfb: Math.max(baseline.ttfb - (improvement.totalSizeSavedMB * 0.05), 0.4),
-            loadTime: Math.max(baseline.loadTime - improvement.loadTimeImprovement, 2.0),
-            speedIndex: Math.max(baseline.speedIndex - (improvement.loadTimeImprovement * 0.8), 2.5)
-          }
+          improvement
         });
       }
     }
 
-    // Calculate overall average metrics
-    const baseline = getBaselineMetrics();
-    let overall = {
-      before: { ...baseline },
-      after: { ...baseline }
-    };
-
-    if (pageAnalyses.length > 0) {
-      // Calculate averages from optimized pages
-      const avgScoreImprovement = pageAnalyses.reduce((sum, p) => sum + p.improvement.scoreImprovement, 0) / pageAnalyses.length;
-      const avgLcpImprovement = pageAnalyses.reduce((sum, p) => sum + p.improvement.lcpImprovement, 0) / pageAnalyses.length;
-      const avgLoadTimeImprovement = pageAnalyses.reduce((sum, p) => sum + p.improvement.loadTimeImprovement, 0) / pageAnalyses.length;
-      const avgTotalSaved = pageAnalyses.reduce((sum, p) => sum + p.improvement.totalSizeSavedMB, 0) / pageAnalyses.length;
-      
-      overall.after = {
-        score: Math.min(Math.round(baseline.score + avgScoreImprovement), 100),
-        lcp: Math.max(parseFloat((baseline.lcp - avgLcpImprovement).toFixed(2)), 1.0),
-        fid: Math.max(baseline.fid - Math.round(avgScoreImprovement * 2), 50),
-        cls: Math.max(parseFloat((baseline.cls - (avgTotalSaved * 0.015)).toFixed(3)), 0.05),
-        ttfb: Math.max(parseFloat((baseline.ttfb - (avgTotalSaved * 0.05)).toFixed(2)), 0.4),
-        loadTime: Math.max(parseFloat((baseline.loadTime - avgLoadTimeImprovement).toFixed(2)), 2.0),
-        speedIndex: Math.max(parseFloat((baseline.speedIndex - (avgLoadTimeImprovement * 0.8)).toFixed(2)), 2.5)
-      };
-    }
-
-    // Build pages array with calculated metrics
+    // Build the pages array from measured compression data only.
     const pages = pageAnalyses.map(page => ({
       id: page.id,
       url: page.url,
       name: page.name,
       fullUrl: page.fullUrl,
       published: page.published,
-      before: page.before,
-      after: page.after,
       imagesOptimized: page.improvement.optimizedImages,
+      originalMB: page.improvement.totalOriginalSizeMB,
+      optimizedMB: page.improvement.totalOptimizedSizeMB,
       savedMB: page.improvement.totalSizeSavedMB,
+      compressionRate: page.improvement.compressionRate,
       improvement: page.improvement
     }));
 
@@ -383,28 +334,17 @@ export async function loader({ request }) {
       insights.push({
         id: '1',
         type: 'success',
-        title: 'Significant Image Optimization Achieved',
-        description: `Successfully reduced total image payload by ${totalSaved.toFixed(1)} MB across ${pageAnalyses.length} product pages. This represents ${avgCompression.toFixed(0)}% average compression, with ${totalImages} images optimized.`,
+        title: 'Image Payload Reduced',
+        description: `Total image payload reduced by ${totalSaved.toFixed(1)} MB across ${pageAnalyses.length} product pages (${avgCompression.toFixed(0)}% average compression, ${totalImages} images optimized). These figures are measured from the actual file sizes before and after compression.`,
         impact: 'high',
         status: 'completed'
       });
-      
-      const avgScoreIncrease = pageAnalyses.reduce((sum, p) => sum + p.improvement.scoreImprovement, 0) / pageAnalyses.length;
+
       insights.push({
         id: '2',
         type: 'info',
-        title: 'Projected Performance Score Gain',
-        description: `Against a typical e-commerce baseline of ${baseline.score}, this much compression projects to about ${avgScoreIncrease.toFixed(0)} points of Lighthouse improvement. This is a projection from published benchmarks, not a measurement of your storefront — run a live PageSpeed test on a page for its real score.`,
-        impact: 'medium',
-        status: 'pending'
-      });
-      
-      const avgLoadTimeReduction = pageAnalyses.reduce((sum, p) => sum + p.improvement.loadTimeImprovement, 0) / pageAnalyses.length;
-      insights.push({
-        id: '3',
-        type: 'info',
-        title: 'Projected Faster Page Load Times',
-        description: `The payload you removed projects to roughly ${avgLoadTimeReduction.toFixed(1)}s less load time per page on a typical mobile connection. Faster load times correlate with better conversion, but this figure is an estimate from the bytes saved rather than a measurement.`,
+        title: 'Smaller Images Generally Improve Core Web Vitals',
+        description: 'Reducing image transfer size typically improves load time and Largest Contentful Paint, especially on mobile connections. To see the measured impact on your store, run a live PageSpeed test below — results vary by theme, hosting, and other page content.',
         impact: 'medium',
         status: 'pending'
       });
@@ -413,17 +353,17 @@ export async function loader({ request }) {
     const unoptimizedCount = products.length - pageAnalyses.length;
     if (unoptimizedCount > 0) {
       insights.push({
-        id: '4',
+        id: '3',
         type: 'warning',
         title: 'Additional Optimization Opportunities',
-        description: `${unoptimizedCount} product pages have not been optimized yet. Running image optimization on these pages could yield an estimated ${(unoptimizedCount * 1.5).toFixed(1)} MB in additional savings.`,
+        description: `${unoptimizedCount} product pages have not been optimized yet. Run image optimization on these pages to reduce their image payload as well.`,
         impact: 'medium',
         status: 'pending'
       });
     }
 
     insights.push({
-      id: '5',
+      id: '4',
       type: 'info',
       title: 'Ongoing Performance Monitoring',
       description: 'Continue monitoring Core Web Vitals and run periodic optimizations as new products are added. Consider implementing lazy loading for below-the-fold images.',
@@ -431,38 +371,22 @@ export async function loader({ request }) {
       status: 'pending'
     });
 
-    // Add SEO insight if improvements are significant
-    if (overall.after.score >= 80) {
-      insights.push({
-        id: '6',
-        type: 'success',
-        title: 'SEO Benefits from Performance Optimization',
-        description: 'Your improved performance scores positively impact search engine rankings. Google uses Core Web Vitals as a ranking factor, and faster pages typically see better organic search visibility.',
-        impact: 'medium',
-        status: 'completed'
-      });
-    }
-
-    return { 
-      overall, 
-      pages, 
-      insights, 
+    return {
+      pages,
+      insights,
       selectedPage,
       shopUrl,
       totalProducts: products.length,
       optimizedProducts: pageAnalyses.length,
       totalImagesSaved: totalSaved,
+      totalOriginalMB: pageAnalyses.reduce((sum, p) => sum + p.improvement.totalOriginalSizeMB, 0),
       totalImagesOptimized: totalImages,
-      error: null 
+      avgCompression,
+      error: null
     };
   } catch (error) {
     console.error('Error loading page speed data:', error);
-    const baseline = getBaselineMetrics();
     return {
-      overall: {
-        before: { ...baseline },
-        after: { ...baseline }
-      },
       pages: [],
       insights: [{
         id: 'error',
@@ -477,7 +401,9 @@ export async function loader({ request }) {
       totalProducts: 0,
       optimizedProducts: 0,
       totalImagesSaved: 0,
+      totalOriginalMB: 0,
       totalImagesOptimized: 0,
+      avgCompression: 0,
       error: 'Failed to load page speed data'
     };
   }
@@ -533,16 +459,17 @@ export async function action({ request }) {
 
 export default function PageSpeedImpactReports() {
   const { 
-    overall, 
-    pages, 
-    insights, 
+    pages,
+    insights,
     selectedPage: initialSelectedPage,
     shopUrl,
     totalProducts,
     optimizedProducts,
     totalImagesSaved,
+    totalOriginalMB,
     totalImagesOptimized,
-    error: loadError 
+    avgCompression,
+    error: loadError
   } = useLoaderData();
   
   const submit = useSubmit();
@@ -619,13 +546,6 @@ export default function PageSpeedImpactReports() {
     return 'Poor';
   };
 
-  const calculateImprovement = (before, after) => {
-    if (before === 0) return 0;
-    return Math.abs((((before - after) / before) * 100)).toFixed(0);
-  };
-
-  const currentData = selectedPage === 'all' ? overall : pages.find(p => p.id === selectedPage) || overall;
-
   // Only show a measurement against the page it was taken on.
   const showLive = Boolean(liveResult) && liveResultPage === selectedPage;
 
@@ -659,31 +579,25 @@ export default function PageSpeedImpactReports() {
     }
   };
 
+  // Every column here is a measured file size from the optimization run. No
+  // Lighthouse number appears in this table — a score for a page only exists
+  // once Google has actually loaded it, and that result is shown on its own.
   const pageTableRows = pages.slice(0, 20).map((page) => [
     <BlockStack key={`${page.id}-name`} gap="100">
       <Text variant="bodyMd" as="p" fontWeight="semibold">{page.name}</Text>
       <Text variant="bodySm" as="p" tone="subdued">{page.url}</Text>
     </BlockStack>,
-    <InlineStack key={`${page.id}-score`} gap="100" blockAlign="center">
-      <Text variant="bodySm" as="span" tone="subdued">{page.before.score}</Text>
-      <Text variant="bodySm" as="span">→</Text>
-      <Text variant="bodyMd" as="span" tone="success" fontWeight="semibold">{page.after.score}</Text>
-      <Badge tone="success">+{page.after.score - page.before.score}</Badge>
-    </InlineStack>,
-    <Text key={`${page.id}-lcp`} variant="bodySm" as="p">
-      <Text as="span" tone="subdued">{page.before.lcp}s</Text> → <Text as="span" tone="success" fontWeight="semibold">{page.after.lcp}s</Text>
-    </Text>,
-    <Text key={`${page.id}-load`} variant="bodySm" as="p">
-      <Text as="span" tone="subdued">{page.before.loadTime}s</Text> → <Text as="span" tone="success" fontWeight="semibold">{page.after.loadTime}s</Text>
-    </Text>,
     <Text key={`${page.id}-images`} variant="bodyMd" as="p">{page.imagesOptimized}</Text>,
-    <Text key={`${page.id}-saved`} variant="bodyMd" as="p" tone="success" fontWeight="semibold">{page.savedMB.toFixed(1)} MB</Text>
+    <Text key={`${page.id}-before`} variant="bodyMd" as="p">{page.originalMB.toFixed(2)} MB</Text>,
+    <Text key={`${page.id}-after`} variant="bodyMd" as="p">{page.optimizedMB.toFixed(2)} MB</Text>,
+    <Text key={`${page.id}-saved`} variant="bodyMd" as="p" tone="success" fontWeight="semibold">{page.savedMB.toFixed(2)} MB</Text>,
+    <Badge key={`${page.id}-rate`} tone="success">{`${Math.round(page.compressionRate)}%`}</Badge>
   ]);
 
   return (
     <Page
       title="Page Speed Impact Analysis"
-      subtitle="Projected impact of your image optimization, plus live measurement from Google PageSpeed Insights"
+      subtitle="Measured image savings from your optimization runs, plus live PageSpeed tests"
       primaryAction={
         selectedPage !== 'all' && pages.length > 0
           ? {
@@ -731,14 +645,14 @@ export default function PageSpeedImpactReports() {
                 <strong>{optimizedProducts}</strong> out of <strong>{totalProducts}</strong> product pages have been optimized.
               </Text>
               <Text variant="bodyMd" as="p">
-                Total savings: <strong>{totalImagesSaved.toFixed(1)} MB</strong> across <strong>{totalImagesOptimized}</strong> images.
-                These savings are measured from your store.
+                Measured savings: <strong>{totalImagesSaved.toFixed(1)} MB</strong> across{' '}
+                <strong>{totalImagesOptimized}</strong> images
+                {totalOriginalMB > 0 && ` — ${totalOriginalMB.toFixed(1)} MB down to ${Math.max(totalOriginalMB - totalImagesSaved, 0).toFixed(1)} MB, ${Math.round(avgCompression)}% average compression`}.
               </Text>
               <Text variant="bodyMd" as="p">
-                The speed scores below are <strong>projections</strong> — they apply published
-                industry benchmarks to your compression data against a typical e-commerce
-                baseline, and are not measured on your storefront. For real numbers, pick a
-                page and use <strong>Run Live PageSpeed Test</strong>.
+                Lighthouse scores and Core Web Vitals are only shown when they have actually been
+                measured: pick a page and use <strong>Run Live PageSpeed Test</strong>, which asks
+                Google to load that page as it is right now.
               </Text>
             </BlockStack>
           </Banner>
@@ -756,16 +670,9 @@ export default function PageSpeedImpactReports() {
                   onChange={handlePageChange} 
                 />
               </Box>
-              <InlineStack gap="400">
-                <InlineStack gap="200" blockAlign="center">
-                  <Box background="bg-fill-critical" padding="100" borderRadius="100" minWidth="12px" minHeight="12px" />
-                  <Text variant="bodySm" as="p" tone="subdued">Before Optimization</Text>
-                </InlineStack>
-                <InlineStack gap="200" blockAlign="center">
-                  <Box background="bg-fill-success" padding="100" borderRadius="100" minWidth="12px" minHeight="12px" />
-                  <Text variant="bodySm" as="p" tone="subdued">After Optimization</Text>
-                </InlineStack>
-              </InlineStack>
+              <Text variant="bodySm" as="p" tone="subdued">
+                Pick a page to run a live test on it
+              </Text>
             </InlineStack>
           </Card>
         </Layout.Section>
@@ -776,14 +683,14 @@ export default function PageSpeedImpactReports() {
               <Text variant="bodyMd" as="p">
                 "{currentPageMeta.name}" isn't published to the Online Store sales channel, so Google
                 can't load it and a live PageSpeed test would fail. Publish the product, or pick a page
-                that's live on your storefront. The projections below still apply — they're based on the
-                images you've already optimized.
+                that's live on your storefront. The measured savings below still apply — they come from
+                the images you've already optimized.
               </Text>
             </Banner>
           </Layout.Section>
         )}
 
-        {/* Measured result — real Google data, above the projections on purpose */}
+        {/* Measured result — the only Lighthouse numbers on this page */}
         {showLive && (
           <Layout.Section>
             <Card>
@@ -793,7 +700,7 @@ export default function PageSpeedImpactReports() {
                   <Badge tone="success">Live from Google PageSpeed Insights</Badge>
                 </InlineStack>
                 <Text variant="bodySm" as="p" tone="subdued">
-                  Measured on this page as it is right now. These are real numbers, not projections.
+                  Measured on this page as it is right now, by Google.
                 </Text>
                 <InlineStack gap="600" wrap={true} blockAlign="start">
                   <BlockStack gap="100" inlineAlign="center">
@@ -824,127 +731,26 @@ export default function PageSpeedImpactReports() {
           </Layout.Section>
         )}
 
-        {/* Performance Score */}
-        <Layout.Section>
-          <InlineStack gap="400" wrap={true}>
-            <Box minWidth="300px" width="50%">
-              <Card>
-                <BlockStack gap="500">
-                  <BlockStack gap="100">
-                    <Text variant="headingMd" as="h3">Projected Performance Score</Text>
-                    <Text variant="bodySm" as="p" tone="subdued">
-                      Estimated from compression data — not measured on your store.
-                    </Text>
-                  </BlockStack>
-                  <InlineStack align="center" gap="600">
-                    <BlockStack gap="200" inlineAlign="center">
-                      <Text variant="bodySm" as="p" tone="subdued">Before</Text>
-                      <Text variant="heading3xl" as="p" tone={getScoreTone(currentData.before.score)}>
-                        {currentData.before.score}
-                      </Text>
-                      <Text variant="bodySm" as="p" tone="subdued">
-                        {getScoreLabel(currentData.before.score)}
-                      </Text>
-                    </BlockStack>
-
-                    <BlockStack gap="200" inlineAlign="center">
-                      <Box background="bg-fill-success" padding="300" borderRadius="100">
-                        <Text variant="heading2xl" as="p" tone="success">↑</Text>
-                      </Box>
-                      <Text variant="heading2xl" as="p" tone="success" fontWeight="bold">
-                        +{currentData.after.score - currentData.before.score}
-                      </Text>
-                    </BlockStack>
-
-                    <BlockStack gap="200" inlineAlign="center">
-                      <Text variant="bodySm" as="p" tone="subdued">After</Text>
-                      <Text variant="heading3xl" as="p" tone={getScoreTone(currentData.after.score)}>
-                        {currentData.after.score}
-                      </Text>
-                      <Text variant="bodySm" as="p" tone="subdued">
-                        {getScoreLabel(currentData.after.score)}
-                      </Text>
-                    </BlockStack>
-                  </InlineStack>
-                </BlockStack>
-              </Card>
-            </Box>
-
-            <Box minWidth="300px" width="50%">
-              <Card>
-                <BlockStack gap="500">
-                  <BlockStack gap="100">
-                    <Text variant="headingMd" as="h3">Projected Core Web Vitals</Text>
-                    <Text variant="bodySm" as="p" tone="subdued">
-                      Estimated from compression data — not measured on your store.
-                    </Text>
-                  </BlockStack>
-                  <BlockStack gap="400">
-                    {metrics.map(metric => {
-                      const improvement = calculateImprovement(currentData.before[metric.id], currentData.after[metric.id]);
-                      return (
-                        <BlockStack key={metric.id} gap="300">
-                          <InlineStack align="space-between">
-                            <Text variant="bodyMd" as="p">
-                              <Text as="span" fontWeight="semibold">{metric.name}</Text>
-                              <Text as="span" tone="subdued"> ({metric.label})</Text>
-                            </Text>
-                            <Badge tone="success">-{improvement}%</Badge>
-                          </InlineStack>
-                          <InlineStack gap="200" blockAlign="center" wrap={false}>
-                            <Box width="45%">
-                              <InlineStack gap="100" blockAlign="center" wrap={false}>
-                                <Text variant="bodySm" as="p" tone="critical" alignment="end" minWidth="60px">
-                                  {currentData.before[metric.id]}{metric.unit}
-                                </Text>
-                                <Box width="100%">
-                                  <ProgressBar
-                                    progress={Math.min((currentData.before[metric.id] / (metric.goodThreshold * 2)) * 100, 100)}
-                                    size="small"
-                                    tone="critical"
-                                  />
-                                </Box>
-                              </InlineStack>
-                            </Box>
-                            <Box width="45%">
-                              <InlineStack gap="100" blockAlign="center" wrap={false}>
-                                <Box width="100%">
-                                  <ProgressBar
-                                    progress={Math.min((currentData.after[metric.id] / (metric.goodThreshold * 2)) * 100, 100)}
-                                    size="small"
-                                    tone="success"
-                                  />
-                                </Box>
-                                <Text variant="bodySm" as="p" tone="success" minWidth="60px">
-                                  {currentData.after[metric.id]}{metric.unit}
-                                </Text>
-                              </InlineStack>
-                            </Box>
-                          </InlineStack>
-                        </BlockStack>
-                      );
-                    })}
-                  </BlockStack>
-                </BlockStack>
-              </Card>
-            </Box>
-          </InlineStack>
-        </Layout.Section>
-
         {/* Page-by-Page Performance */}
         {pages.length > 0 && (
           <Layout.Section>
             <Card>
               <BlockStack gap="400">
-                <InlineStack align="space-between" blockAlign="center">
-                  <Text variant="headingMd" as="h3">Optimized Pages — Projected Impact</Text>
-                  {pages.length > 20 && (
-                    <Badge tone="info">Showing first 20 of {pages.length} pages</Badge>
-                  )}
-                </InlineStack>
+                <BlockStack gap="100">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text variant="headingMd" as="h3">Optimized Pages — Measured Savings</Text>
+                    {pages.length > 20 && (
+                      <Badge tone="info">{`Showing first 20 of ${pages.length} pages`}</Badge>
+                    )}
+                  </InlineStack>
+                  <Text variant="bodySm" as="p" tone="subdued">
+                    Before and After are the total image weight of each page, measured during
+                    optimization.
+                  </Text>
+                </BlockStack>
                 <DataTable
-                  columnContentTypes={['text', 'text', 'text', 'text', 'numeric', 'text']}
-                  headings={['Page', 'Score (Before → After)', 'LCP', 'Load Time', 'Images', 'Saved']}
+                  columnContentTypes={['text', 'numeric', 'text', 'text', 'text', 'text']}
+                  headings={['Page', 'Images', 'Before', 'After', 'Saved', 'Compression']}
                   rows={pageTableRows}
                 />
               </BlockStack>
@@ -980,9 +786,9 @@ export default function PageSpeedImpactReports() {
                 <Text variant="headingMd" as="h3">Live Performance Testing</Text>
                 <Text variant="bodyMd" as="p">
                   Select a specific page above and click "Run Live PageSpeed Test" to measure it with
-                  Google PageSpeed Insights. That result is real measured data for that page, and appears
-                  above the projections. The test isn't available for "All Pages (Average)" — Google
-                  measures one URL at a time.
+                  Google PageSpeed Insights. The result appears at the top of this page and is the only
+                  place a performance score is shown. The test isn't available for "All Pages (Average)"
+                  — Google measures one URL at a time.
                 </Text>
                 <Text variant="bodySm" as="p" tone="subdued">
                   A test takes 30-60 seconds and counts against your plan's monthly PageSpeed reports.
