@@ -83,7 +83,8 @@ async function getAllProductHandles(admin) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // One PSI attempt. Throws { retryable } so the caller can decide to retry.
-async function pageSpeedAttempt(apiUrl) {
+// `requestedUrl` is only used to check what Google actually ended up loading.
+async function pageSpeedAttempt(apiUrl, requestedUrl) {
   const controller = new AbortController();
   // A Lighthouse run takes 30-60s and the request has no deadline of its own,
   // so without this the action can hang until the platform kills it and the
@@ -127,6 +128,43 @@ async function pageSpeedAttempt(apiUrl) {
     throw err;
   }
 
+  /**
+   * Check WHICH page Google measured.
+   *
+   * A password-protected storefront 302s every URL to /password, and Google
+   * follows it happily: the product URL above came back scored 97, measured on
+   * the password gate — a near-empty page with none of the merchant's images
+   * on it. Reporting that as "Measured Results — <product>" would be a made-up
+   * number wearing a real number's clothes, so it is refused instead.
+   */
+  const finalUrl = lighthouseResult.finalDisplayedUrl || lighthouseResult.finalUrl || '';
+  let finalPath = '';
+  try { finalPath = new URL(finalUrl).pathname; } catch { /* leave blank */ }
+  if (/^\/password\b/.test(finalPath)) {
+    const err = new Error(
+      'Your storefront is password-protected, so Google was redirected to the password page ' +
+      'and measured that instead of your product. Turn off password protection in Online Store → ' +
+      'Preferences, then run the test again.'
+    );
+    // No amount of retrying gets past a password page.
+    err.retryable = false;
+    err.userFacing = true;
+    throw err;
+  }
+  if (finalPath && requestedUrl) {
+    let requestedPath = '';
+    try { requestedPath = new URL(requestedUrl).pathname; } catch { /* leave blank */ }
+    if (requestedPath && finalPath !== requestedPath) {
+      const err = new Error(
+        `Google was redirected from ${requestedPath} to ${finalPath}, so the result would not be ` +
+        'for the page you picked. Check that the product page opens directly in a private browser window.'
+      );
+      err.retryable = false;
+      err.userFacing = true;
+      throw err;
+    }
+  }
+
   // Extract performance score
   const performanceScore = Math.round((lighthouseResult.categories.performance?.score || 0) * 100);
 
@@ -162,8 +200,12 @@ async function pageSpeedAttempt(apiUrl) {
  * The keyless endpoint is rate-limited to roughly 1-2 requests a minute, so a
  * single attempt fails far more often than the storefront is actually broken —
  * we retry with backoff (up to 3 attempts) on 429/5xx/timeout. A bad or
- * unreachable URL is not retried, because re-running it cannot help. Returns
- * null only after every attempt has failed.
+ * unreachable URL is not retried, because re-running it cannot help.
+ *
+ * Returns { result } on success, or { error } carrying a sentence the merchant
+ * can act on when we know what went wrong (a password-protected storefront
+ * being the common one) — the caller used to replace every failure with the
+ * same canned paragraph, which buried the specific reason.
  */
 async function runPageSpeedTest(url) {
   const apiKey = process.env.GOOGLE_PAGESPEED_API_KEY;
@@ -177,7 +219,7 @@ async function runPageSpeedTest(url) {
   for (let attempt = 0; attempt < backoffs.length; attempt++) {
     if (backoffs[attempt]) await sleep(backoffs[attempt]);
     try {
-      return await pageSpeedAttempt(apiUrl);
+      return { result: await pageSpeedAttempt(apiUrl, url) };
     } catch (e) {
       lastErr = e;
       console.error(`PageSpeed attempt ${attempt + 1} failed for ${url}:`, e?.message || e);
@@ -185,7 +227,7 @@ async function runPageSpeedTest(url) {
     }
   }
   console.error('PageSpeed test failed after retries:', lastErr?.message || lastErr);
-  return null;
+  return { result: null, error: lastErr?.userFacing ? lastErr.message : null };
 }
 
 /**
@@ -461,9 +503,11 @@ export async function action({ request }) {
 
     try {
       console.log('Running PageSpeed analysis for:', pageUrl);
-      const result = await runPageSpeedTest(pageUrl);
+      const { result, error: reason } = await runPageSpeedTest(pageUrl);
 
       if (!result) {
+        // A reason we can name beats the catch-all paragraph below.
+        if (reason) return { success: false, error: reason };
         throw new Error('Failed to run PageSpeed test');
       }
 
