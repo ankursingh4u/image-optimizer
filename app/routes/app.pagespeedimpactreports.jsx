@@ -310,6 +310,30 @@ export async function loader({ request }) {
       }
     }
 
+    /**
+     * What the live test can be pointed at: every product published to the
+     * Online Store, optimized or not.
+     *
+     * The selector used to offer only optimized products, which made the
+     * card's own advice — run a test before and after optimizing, to see the
+     * difference — impossible to follow, because a page did not appear in the
+     * list until after it had been optimized. An unpublished product stays out
+     * either way: Google fetches the public URL, so there would be nothing to
+     * load.
+     */
+    const testablePages = products
+      .filter(product => Boolean(product.onlineStoreUrl))
+      .map(product => ({
+        id: product.handle,
+        name: product.title,
+        url: `/products/${product.handle}`,
+        fullUrl: product.onlineStoreUrl,
+        optimized: (() => {
+          const i = calculatePerformanceImprovement(product);
+          return Boolean(i && i.totalSizeSavedMB > 0);
+        })(),
+      }));
+
     // Build the pages array from measured compression data only.
     const pages = pageAnalyses.map(page => ({
       id: page.id,
@@ -377,6 +401,8 @@ export async function loader({ request }) {
 
     return {
       pages,
+      testablePages,
+      unpublishedCount: products.length - testablePages.length,
       insights,
       selectedPage,
       shopUrl,
@@ -392,6 +418,8 @@ export async function loader({ request }) {
     console.error('Error loading page speed data:', error);
     return {
       pages: [],
+      testablePages: [],
+      unpublishedCount: 0,
       insights: [{
         id: 'error',
         type: 'critical',
@@ -467,6 +495,8 @@ export async function action({ request }) {
 export default function PageSpeedImpactReports() {
   const { 
     pages,
+    testablePages,
+    unpublishedCount,
     insights,
     selectedPage: initialSelectedPage,
     shopUrl,
@@ -483,14 +513,12 @@ export default function PageSpeedImpactReports() {
   const navigation = useNavigation();
   const actionData = useActionData();
   
-  // Start on a page the test can actually run against. Only products published
-  // to the Online Store are reachable by Google, so landing on an unpublished
-  // one greets the merchant with a disabled button and a warning — the feature
-  // looks broken when it is only pointed at the wrong page.
+  // Prefer a page that has already been optimized — its measured savings are
+  // on this screen, so a score for it is the most useful first measurement.
   const [selectedPage, setSelectedPage] = useState(
-    initialSelectedPage !== 'all' && pages.some(p => p.id === initialSelectedPage)
+    testablePages.some(p => p.id === initialSelectedPage)
       ? initialSelectedPage
-      : (pages.find(p => p.published)?.id || pages[0]?.id || '')
+      : (testablePages.find(p => p.optimized)?.id || testablePages[0]?.id || '')
   );
   const [showSuccessBanner, setShowSuccessBanner] = useState(false);
 
@@ -510,15 +538,15 @@ export default function PageSpeedImpactReports() {
   }, []);
 
   const handleRunLighthouse = useCallback(() => {
-    const currentPage = pages.find(p => p.id === selectedPage);
-    if (!currentPage || !currentPage.published) return;
+    const currentPage = testablePages.find(p => p.id === selectedPage);
+    if (!currentPage) return;
 
     const formData = new FormData();
     formData.append('actionType', 'runLighthouseAnalysis');
     formData.append('pageUrl', currentPage.fullUrl);
     formData.append('pageName', currentPage.name);
     submit(formData, { method: 'post' });
-  }, [selectedPage, pages, submit]);
+  }, [selectedPage, testablePages, submit]);
 
   const getScoreTone = (score) => {
     if (score >= 90) return 'success';
@@ -532,17 +560,16 @@ export default function PageSpeedImpactReports() {
     return 'Poor';
   };
 
-  const currentPageMeta = pages.find(p => p.id === selectedPage) || null;
-  // Google can only load a page that's actually published to the Online Store.
-  const canRunLive = Boolean(currentPageMeta?.published);
+  // Everything in the list is published, so everything in it is testable.
+  const currentPageMeta = testablePages.find(p => p.id === selectedPage) || null;
+  const canRunLive = Boolean(currentPageMeta);
 
-  // Marked in the list, so an untestable page is obvious before it is chosen
-  // rather than after.
-  const pageOptions = pages.map(page => ({
-    label: `${page.name || page.url}${page.published ? '' : ' — not published'}`,
+  // Optimized pages are marked, so it's clear which scores can be read
+  // alongside measured savings and which are a before-optimization baseline.
+  const pageOptions = testablePages.map(page => ({
+    label: `${page.name || page.url}${page.optimized ? ' — optimized' : ''}`,
     value: page.id,
   }));
-  const anyPublished = pages.some(p => p.published);
 
   // The measurement comes straight from the action result, so it belongs to the
   // page that was tested by construction — it cannot end up displayed under a
@@ -656,39 +683,37 @@ export default function PageSpeedImpactReports() {
                 Run a real Lighthouse test via Google PageSpeed Insights to measure the current performance of a product page.
                 This is actual measured data for your store, not an estimate.
               </Text>
-              {pages.length > 0 ? (
-                <InlineStack gap="400" blockAlign="end" wrap={true}>
-                  <Box minWidth="300px">
-                    <Select
-                      label="Select Page"
-                      options={pageOptions}
-                      value={selectedPage}
-                      onChange={handlePageChange}
-                    />
-                  </Box>
-                  <Button
-                    variant="primary"
-                    onClick={handleRunLighthouse}
-                    loading={isRunningAnalysis}
-                    // Disabled rather than hidden when the product isn't published —
-                    // the banner below explains why, which beats a button that
-                    // silently burns one of the plan's monthly reports on a 404.
-                    disabled={isRunningAnalysis || !selectedPage || !canRunLive}
-                  >
-                    {isRunningAnalysis ? 'Running test…' : 'Run Live PageSpeed Test'}
-                  </Button>
-                </InlineStack>
+              {testablePages.length > 0 ? (
+                <BlockStack gap="200">
+                  <InlineStack gap="400" blockAlign="end" wrap={true}>
+                    <Box minWidth="320px">
+                      <Select
+                        label="Select Page"
+                        options={pageOptions}
+                        value={selectedPage}
+                        onChange={handlePageChange}
+                      />
+                    </Box>
+                    <Button
+                      variant="primary"
+                      onClick={handleRunLighthouse}
+                      loading={isRunningAnalysis}
+                      disabled={isRunningAnalysis || !canRunLive}
+                    >
+                      {isRunningAnalysis ? 'Running test…' : 'Run Live PageSpeed Test'}
+                    </Button>
+                  </InlineStack>
+                  <Text variant="bodySm" as="p" tone="subdued">
+                    {`Any of your ${testablePages.length} published product pages can be tested, optimized or not`}
+                    {unpublishedCount > 0 && ` — ${unpublishedCount} more aren't published to the Online Store, so Google can't load them`}.
+                  </Text>
+                </BlockStack>
               ) : (
-                <Text variant="bodyMd" as="p" tone="subdued">
-                  Optimize at least one product page first, then come back here to measure its performance.
-                </Text>
-              )}
-              {pages.length > 0 && !anyPublished && (
                 <Banner tone="warning">
                   <Text variant="bodyMd" as="p">
-                    None of your optimized products are published to the Online Store sales channel yet,
-                    so Google has no page it can load. Publish one and the live test becomes available —
-                    the measured savings below don't depend on it.
+                    None of your products are published to the Online Store sales channel, so Google has no
+                    page it can load. Publish one and the live test becomes available — the measured savings
+                    below don't depend on it.
                   </Text>
                 </Banner>
               )}
@@ -700,21 +725,6 @@ export default function PageSpeedImpactReports() {
             </BlockStack>
           </Card>
         </Layout.Section>
-
-        {/* Only when other pages ARE testable — if none are, the card above
-            already says so and this would just repeat it per selection. */}
-        {currentPageMeta && !canRunLive && anyPublished && (
-          <Layout.Section>
-            <Banner title="Live testing isn't available for this page" tone="warning">
-              <Text variant="bodyMd" as="p">
-                "{currentPageMeta.name}" isn't published to the Online Store sales channel, so Google
-                can't load it and a live PageSpeed test would fail. Publish the product, or pick a page
-                that's live on your storefront. The measured savings below still apply — they come from
-                the images you've already optimized.
-              </Text>
-            </Banner>
-          </Layout.Section>
-        )}
 
         {/* Live test results — the only Lighthouse numbers on this page */}
         {showSuccessBanner && liveResult && (
