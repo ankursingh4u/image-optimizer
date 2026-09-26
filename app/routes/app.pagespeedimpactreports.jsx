@@ -483,13 +483,14 @@ export default function PageSpeedImpactReports() {
   const navigation = useNavigation();
   const actionData = useActionData();
   
-  // The selector starts on a real page. There used to be an "All Pages
-  // (Average)" entry that the live test could never run against, so the
-  // default state of this screen was one where the button did nothing.
+  // Start on a page the test can actually run against. Only products published
+  // to the Online Store are reachable by Google, so landing on an unpublished
+  // one greets the merchant with a disabled button and a warning — the feature
+  // looks broken when it is only pointed at the wrong page.
   const [selectedPage, setSelectedPage] = useState(
     initialSelectedPage !== 'all' && pages.some(p => p.id === initialSelectedPage)
       ? initialSelectedPage
-      : (pages[0]?.id || '')
+      : (pages.find(p => p.published)?.id || pages[0]?.id || '')
   );
   const [showSuccessBanner, setShowSuccessBanner] = useState(false);
 
@@ -535,7 +536,13 @@ export default function PageSpeedImpactReports() {
   // Google can only load a page that's actually published to the Online Store.
   const canRunLive = Boolean(currentPageMeta?.published);
 
-  const pageOptions = pages.map(page => ({ label: page.name || page.url, value: page.id }));
+  // Marked in the list, so an untestable page is obvious before it is chosen
+  // rather than after.
+  const pageOptions = pages.map(page => ({
+    label: `${page.name || page.url}${page.published ? '' : ' — not published'}`,
+    value: page.id,
+  }));
+  const anyPublished = pages.some(p => p.published);
 
   // The measurement comes straight from the action result, so it belongs to the
   // page that was tested by construction — it cannot end up displayed under a
@@ -676,6 +683,15 @@ export default function PageSpeedImpactReports() {
                   Optimize at least one product page first, then come back here to measure its performance.
                 </Text>
               )}
+              {pages.length > 0 && !anyPublished && (
+                <Banner tone="warning">
+                  <Text variant="bodyMd" as="p">
+                    None of your optimized products are published to the Online Store sales channel yet,
+                    so Google has no page it can load. Publish one and the live test becomes available —
+                    the measured savings below don't depend on it.
+                  </Text>
+                </Banner>
+              )}
               <Text variant="bodySm" as="p" tone="subdued">
                 Tests run against the live page on Google's servers and may take 30–60 seconds, and count against
                 your plan's monthly PageSpeed reports. Rate limits apply. Tip: run a test before and after
@@ -685,7 +701,9 @@ export default function PageSpeedImpactReports() {
           </Card>
         </Layout.Section>
 
-        {currentPageMeta && !canRunLive && (
+        {/* Only when other pages ARE testable — if none are, the card above
+            already says so and this would just repeat it per selection. */}
+        {currentPageMeta && !canRunLive && anyPublished && (
           <Layout.Section>
             <Banner title="Live testing isn't available for this page" tone="warning">
               <Text variant="bodyMd" as="p">
