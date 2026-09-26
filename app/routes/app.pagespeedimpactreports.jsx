@@ -594,6 +594,15 @@ export default function PageSpeedImpactReports() {
       subtitle="Measured image savings from your optimization runs, plus live PageSpeed tests"
     >
       <Layout>
+        <Layout.Section>
+          <div className="pb-page-header">
+            <span className="pb-page-header-icon">📊</span>
+            <div>
+              <p className="pb-page-header-title">Page Speed Reports</p>
+              <p className="pb-page-header-sub">Measured image savings & live Core Web Vitals testing</p>
+            </div>
+          </div>
+        </Layout.Section>
         {loadError && (
           <Layout.Section>
             <Banner title="Error" tone="critical">

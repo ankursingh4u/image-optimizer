@@ -115,6 +115,15 @@ export default function Plan() {
   return (
     <Page title="Plan">
       <Layout>
+        <Layout.Section>
+          <div className="pb-page-header">
+            <span className="pb-page-header-icon">💳</span>
+            <div>
+              <p className="pb-page-header-title">Plan & Usage</p>
+              <p className="pb-page-header-sub">Your monthly allowances across images, alt text and reports</p>
+            </div>
+          </div>
+        </Layout.Section>
         {loadError ? (
           <Layout.Section>
             <Banner tone="warning">{loadError}</Banner>

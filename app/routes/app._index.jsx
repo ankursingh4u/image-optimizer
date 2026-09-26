@@ -1,222 +1,195 @@
-import { useEffect } from "react";
-import { useFetcher, useNavigate } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
+import { useNavigate, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import { quotaContext, usageSummary, METRICS } from "../usage.server";
+import {
+  Page,
+  Layout,
+  Card,
+  Button,
+  Badge,
+  Text,
+  BlockStack,
+  InlineStack,
+  Box,
+  ProgressBar,
+  Divider,
+} from "@shopify/polaris";
 
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
-  return null;
-};
+  const { admin, session } = await authenticate.admin(request);
 
-export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
-  return null;
+  // Everything here has to be fast — the browser cannot finish the navigation
+  // until this returns. quotaContext is a cached read; usageSummary is local DB.
+  let tier = "starter";
+  let usage = [];
+  try {
+    const ctx = await quotaContext(admin, session);
+    tier = ctx.tier || "starter";
+    usage = await usageSummary(ctx);
+  } catch (e) {
+    if (e instanceof Response) throw e; // let re-auth propagate
+  }
+
+  const byMetric = Object.fromEntries(usage.map((u) => [u.metric, u]));
+
+  return {
+    tier,
+    images: byMetric[METRICS.IMAGES_OPTIMIZED] || { used: 0, limit: null },
+    altText: byMetric[METRICS.AI_ALT_TEXT] || { used: 0, limit: null },
+    reports: byMetric[METRICS.PAGESPEED_REPORTS] || { used: 0, limit: null },
+  };
 };
 
 export default function Index() {
-  const fetcher = useFetcher();
-  const shopify = useAppBridge();
   const navigate = useNavigate();
+  const { tier, images, altText, reports } = useLoaderData();
+
+  const fmt = (n) => Number(n || 0).toLocaleString();
+  const planName = tier.charAt(0).toUpperCase() + tier.slice(1);
+
+  const quota = images.limit;
+  const used = images.used || 0;
+  const remaining = quota == null ? null : Math.max(0, quota - used);
+  const pct = quota ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+
+  // Numeric stats get the figure treatment; word values get a chip so a long
+  // label can't wrap into an overlapping headline.
+  const stats = [
+    { label: "Current plan", value: planName, chip: "brand" },
+    { label: "Images optimized", value: fmt(used) },
+    { label: "Images left", value: remaining == null ? "Unlimited" : fmt(remaining), chip: remaining == null ? "success" : undefined },
+    { label: "Alt texts left", value: altText.limit == null ? "Unlimited" : fmt(Math.max(0, altText.limit - altText.used)), chip: altText.limit == null ? "success" : undefined },
+  ];
+
+  const tools = [
+    {
+      icon: "⚡",
+      title: "Image Optimizer",
+      desc: "Compress & convert product images to WebP — up to 70% smaller, originals replaced safely.",
+      cta: "Open optimizer",
+      onClick: () => navigate("/app/productoptimization"),
+    },
+    {
+      icon: "✨",
+      title: "AI Alt Text",
+      desc: "Generate SEO alt text for every image with AI vision, then bulk-apply in one click.",
+      cta: "Generate alt text",
+      onClick: () => navigate("/app/alttextsuggestions"),
+      badge: altText.limit == null
+        ? undefined
+        : { label: `${fmt(Math.max(0, altText.limit - altText.used))} left`, tone: "info" },
+    },
+    {
+      icon: "📊",
+      title: "Page Speed Reports",
+      desc: "Measured image savings per page, plus live Core Web Vitals from Google PageSpeed Insights.",
+      cta: "View reports",
+      onClick: () => navigate("/app/pagespeedimpactreports"),
+      badge: reports.limit == null
+        ? undefined
+        : { label: `${fmt(Math.max(0, reports.limit - reports.used))} left`, tone: "info" },
+    },
+    {
+      icon: "📈",
+      title: "Optimization Dashboard",
+      desc: "Every optimization run at a glance — what was compressed, how much was saved, and when.",
+      cta: "Open dashboard",
+      onClick: () => navigate("/app/imageoptimizationdashboard"),
+    },
+  ];
 
   return (
-    <s-page heading="Image Optimizer & SEO Suite">
-      <s-button slot="primary-action" onClick={() => navigate('/app/alttextsuggestions')}>
-        Generate Alt Text
-      </s-button>
+    <Page>
+      {/* Hero */}
+      <div className="pb-hero">
+        <InlineStack align="space-between" blockAlign="center" wrap={false} gap="600">
+          <BlockStack gap="300">
+            <span className="pb-hero-eyebrow">Image Optimizer</span>
+            <div className="pb-hero-copy">
+              <h1>Faster images, better rankings.</h1>
+              <p>Compress and convert your catalog, auto-generate SEO alt text, and measure the page-speed gains — all in one place.</p>
+            </div>
+          </BlockStack>
+          <Button variant="primary" size="large" onClick={() => navigate("/app/productoptimization")}>
+            Optimize images
+          </Button>
+        </InlineStack>
+      </div>
 
-      <s-section heading="Welcome to Your Image Optimization Hub 🚀">
-        <s-paragraph>
-          Boost your store's performance, accessibility, and search rankings with our comprehensive image optimization suite.
-          This app provides three powerful modules to help you optimize images, generate SEO-friendly alt text, and track performance improvements.
-        </s-paragraph>
-      </s-section>
+      <Layout>
+        {/* Stat strip */}
+        <Layout.Section>
+          <div className="pb-stat-grid">
+            {stats.map((s) => (
+              <div key={s.label} className="pb-stat-card">
+                {s.chip ? (
+                  <span className={`pb-stat-chip pb-stat-chip--${s.chip}`} title={s.value}>
+                    {s.value}
+                  </span>
+                ) : (
+                  <p className="pb-stat-value">{s.value}</p>
+                )}
+                <p className="pb-stat-label">{s.label}</p>
+              </div>
+            ))}
+          </div>
+        </Layout.Section>
 
-      <s-section heading="Quick Start Guide">
-        <s-paragraph>
-          Follow these three simple steps to optimize your store:
-        </s-paragraph>
-        <s-stack direction="block" gap="base">
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">Step 1: Generate AI Alt Text 🤖</s-heading>
-              <s-paragraph>
-                Use AI to create SEO-optimized descriptions for your product images. Supports Claude, OpenAI, and smart fallback options.
-              </s-paragraph>
-              <s-button onClick={() => navigate('/app/alttextsuggestions')}>
-                Start Generating Alt Text →
-              </s-button>
-            </s-stack>
-          </s-box>
+        {/* Monthly usage */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="300">
+              <InlineStack align="space-between" blockAlign="center">
+                <InlineStack gap="200" blockAlign="center">
+                  <Text variant="headingSm" as="h2">Monthly image usage</Text>
+                  <Badge tone={tier === "starter" ? undefined : "success"}>{`${planName} plan`}</Badge>
+                </InlineStack>
+                <Button variant="plain" onClick={() => navigate("/app/plan")}>Manage plan</Button>
+              </InlineStack>
+              <ProgressBar progress={pct} size="small" tone={pct >= 100 ? "critical" : "primary"} />
+              <Text variant="bodySm" as="p" tone="subdued">
+                {quota == null
+                  ? `${fmt(used)} images optimized this month · unlimited on your plan`
+                  : `${fmt(used)} of ${fmt(quota)} images this month · ${fmt(remaining)} remaining`}
+              </Text>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
 
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">Step 2: Optimize Images ⚡</s-heading>
-              <s-paragraph>
-                Compress images to reduce file sizes by up to 70%. Automatic WebP conversion and smart compression for maximum performance.
-              </s-paragraph>
-              <s-button onClick={() => navigate('/app/productoptimization')}>
-                Optimize Your Images →
-              </s-button>
-            </s-stack>
-          </s-box>
-
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">Step 3: Track Performance 📊</s-heading>
-              <s-paragraph>
-                Monitor improvements with detailed analytics. Track Core Web Vitals, run live PageSpeed tests, and see the impact of your optimizations.
-              </s-paragraph>
-              <s-button onClick={() => navigate('/app/pagespeedimpactreports')}>
-                View Performance Reports →
-              </s-button>
-            </s-stack>
-          </s-box>
-        </s-stack>
-      </s-section>
-
-      <s-section heading="Available Modules">
-        <s-stack direction="block" gap="base">
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">✨ AI Alt Text Suggestions</s-heading>
-              <s-paragraph>
-                Generate SEO-optimized alt text for product images using AI. Features include:
-              </s-paragraph>
-              <s-unordered-list>
-                <s-list-item>AI-powered vision analysis (Claude, OpenAI)</s-list-item>
-                <s-list-item>SEO score optimization</s-list-item>
-                <s-list-item>Bulk processing for multiple images</s-list-item>
-                <s-list-item>Edit and customize suggestions</s-list-item>
-              </s-unordered-list>
-              <s-link href="/app/alttextsuggestions">Open Alt Text Generator →</s-link>
-            </s-stack>
-          </s-box>
-
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">⚡ Image Optimization Dashboard</s-heading>
-              <s-paragraph>
-                Compress and optimize product images automatically. Features include:
-              </s-paragraph>
-              <s-unordered-list>
-                <s-list-item>Automatic WebP conversion</s-list-item>
-                <s-list-item>Smart compression (reduce size by 70%)</s-list-item>
-                <s-list-item>Batch optimization for all products</s-list-item>
-                <s-list-item>Size reduction tracking</s-list-item>
-              </s-unordered-list>
-              <s-link href="/app/productoptimization">Open Optimization Dashboard →</s-link>
-            </s-stack>
-          </s-box>
-
-          <s-box
-            padding="base"
-            borderWidth="base"
-            borderRadius="base"
-            background="subdued"
-          >
-            <s-stack direction="block" gap="small">
-              <s-heading size="small">📊 Page Speed Impact Reports</s-heading>
-              <s-paragraph>
-                Track performance improvements and Core Web Vitals. Features include:
-              </s-paragraph>
-              <s-unordered-list>
-                <s-list-item>Live PageSpeed testing integration</s-list-item>
-                <s-list-item>Core Web Vitals tracking (LCP, FID, CLS)</s-list-item>
-                <s-list-item>Before/after performance metrics</s-list-item>
-                <s-list-item>Performance insights and recommendations</s-list-item>
-              </s-unordered-list>
-              <s-link href="/app/pagespeedimpactreports">View Performance Reports →</s-link>
-            </s-stack>
-          </s-box>
-        </s-stack>
-      </s-section>
-
-      <s-section slot="aside" heading="Key Features">
-        <s-paragraph>
-          <s-text>🎨 AI-Powered Alt Text: </s-text>
-          Generate SEO-optimized descriptions using Claude or OpenAI
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>⚡ Smart Compression: </s-text>
-          Reduce image sizes by up to 70% with automatic WebP conversion
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>📈 Performance Tracking: </s-text>
-          Monitor Core Web Vitals and PageSpeed scores in real-time
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>🔄 Batch Processing: </s-text>
-          Process hundreds of images and generate alt text in bulk
-        </s-paragraph>
-      </s-section>
-
-      <s-section slot="aside" heading="Getting Started">
-        <s-unordered-list>
-          <s-list-item>
-            Start by generating{" "}
-            <s-link href="/app/alttextsuggestions">
-              AI alt text
-            </s-link>{" "}
-            for better SEO
-          </s-list-item>
-          <s-list-item>
-            Optimize your images in the{" "}
-            <s-link href="/app/productoptimization">
-              optimization dashboard
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Track improvements in{" "}
-            <s-link href="/app/pagespeedimpactreports">
-              performance reports
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
-      </s-section>
-
-      <s-section slot="aside" heading="Best Practices">
-        <s-unordered-list>
-          <s-list-item>
-            Generate alt text before optimizing images for better organization
-          </s-list-item>
-          <s-list-item>
-            Run optimization on all products for consistent performance
-          </s-list-item>
-          <s-list-item>
-            Monitor PageSpeed reports regularly to track improvements
-          </s-list-item>
-          <s-list-item>
-            Use batch processing for faster workflow with multiple products
-          </s-list-item>
-        </s-unordered-list>
-      </s-section>
-    </s-page>
+        {/* Tools — horizontal rows */}
+        <Layout.Section>
+          <Card padding="0">
+            <BlockStack gap="0">
+              {tools.map((t, i) => (
+                <div key={t.title}>
+                  {i > 0 && <Divider />}
+                  <Box padding="400">
+                    <InlineStack align="space-between" blockAlign="center" wrap={false} gap="400">
+                      <InlineStack gap="400" blockAlign="center" wrap={false}>
+                        <div className="pb-feature-icon">{t.icon}</div>
+                        <BlockStack gap="100">
+                          <InlineStack gap="200" blockAlign="center">
+                            <Text variant="headingSm" as="h3">{t.title}</Text>
+                            {t.badge && <Badge tone={t.badge.tone}>{t.badge.label}</Badge>}
+                          </InlineStack>
+                          <Text variant="bodySm" as="p" tone="subdued">{t.desc}</Text>
+                        </BlockStack>
+                      </InlineStack>
+                      <Box minWidth="160px">
+                        <Button variant="primary" onClick={t.onClick} fullWidth>
+                          {t.cta}
+                        </Button>
+                      </Box>
+                    </InlineStack>
+                  </Box>
+                </div>
+              ))}
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+      </Layout>
+    </Page>
   );
 }
 

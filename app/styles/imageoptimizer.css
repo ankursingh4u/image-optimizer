@@ -1,0 +1,318 @@
+/* Image Optimizer brand theme — ported from PixelPerfect (Sunset Coral).
+   Class names are kept identical to PixelPerfect's so markup moves 1:1
+   between the two apps. */
+
+:root {
+  --op-1: #FF7A45;            /* sunset orange */
+  --op-2: #F4476B;            /* coral rose    */
+  --op-accent: #F4476B;
+  --op-accent-dark: #D62F57;
+  --op-ink: #1A1426;          /* warm near-black */
+  --op-soft-1: #FFF1EC;
+  --op-soft-2: #FFE4EC;
+  --op-grad: linear-gradient(135deg, #FF7A45 0%, #F4476B 100%);
+  --op-grad-dark: linear-gradient(135deg, #F4476B 0%, #B91C50 100%);
+  --op-grad-soft: linear-gradient(135deg, #FFF1EC 0%, #FFE4EC 100%);
+  --op-tint: #FFF7F4;         /* page wash */
+  --op-ring: rgba(244, 71, 107, 0.18);
+}
+
+/* ── Primary buttons ───────────────────────── */
+.Polaris-Button--variantPrimary {
+  background: var(--op-grad) !important;
+  border-color: var(--op-2) !important;
+  box-shadow: 0 2px 8px rgba(244, 71, 107, 0.32) !important;
+}
+.Polaris-Button--variantPrimary:hover:not(:disabled) {
+  background: var(--op-grad-dark) !important;
+  border-color: var(--op-accent-dark) !important;
+}
+.Polaris-Button--variantPrimary:active:not(:disabled) {
+  background: linear-gradient(135deg, #D62F57 0%, #8F1740 100%) !important;
+}
+
+/* ── Links ─────────────────────────────────── */
+.Polaris-Link { color: var(--op-accent) !important; }
+.Polaris-Link:hover { color: var(--op-accent-dark) !important; }
+
+/* ── Focus rings ───────────────────────────── */
+.Polaris-TextField__Input:focus {
+  border-color: var(--op-accent) !important;
+  box-shadow: 0 0 0 3px var(--op-ring) !important;
+}
+
+/* ── Checkboxes ────────────────────────────── */
+.Polaris-Checkbox__Input:checked + .Polaris-Checkbox__Backdrop {
+  background: var(--op-accent) !important;
+  border-color: var(--op-accent) !important;
+}
+
+/* ── Hero banner ───────────────────────────── */
+.pb-hero {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(120% 140% at 88% 8%, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0) 52%),
+    linear-gradient(118deg, #FF8A4C 0%, #F4476B 58%, #C9265A 100%);
+  border-radius: 16px;
+  padding: 32px 36px;
+  color: white;
+  margin-bottom: 20px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 2px rgba(26, 20, 38, 0.08),
+    0 18px 38px -18px rgba(201, 38, 90, 0.55);
+}
+.pb-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0) 38%);
+  pointer-events: none; /* decorative only — must not block the hero button */
+  z-index: -1;
+}
+.pb-hero-copy { max-width: 620px; }
+.pb-hero-copy h1 { margin-bottom: 10px; }
+.pb-hero-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 999px;
+  padding: 4px 11px 4px 9px;
+  margin: 0;
+}
+.pb-hero-eyebrow::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #FFFFFF;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.28);
+}
+.pb-hero h1 {
+  font-size: 28px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+  color: white;
+}
+.pb-hero p {
+  font-size: 14px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.88);
+  margin: 0;
+}
+/* The hero sits on the brand gradient, so the gradient button would vanish
+   into it — invert to a solid white button instead. */
+.pb-hero .Polaris-Button--variantPrimary {
+  background: #FFFFFF !important;
+  border-color: rgba(255, 255, 255, 0.9) !important;
+  color: #C9265A !important;
+  box-shadow: 0 6px 16px -6px rgba(26, 20, 38, 0.45) !important;
+}
+.pb-hero .Polaris-Button--variantPrimary:hover:not(:disabled) {
+  background: #FFF4F0 !important;
+  border-color: #FFF4F0 !important;
+  color: #A81A49 !important;
+}
+.pb-hero .Polaris-Button--variantPrimary:active:not(:disabled) {
+  background: #FFE7DF !important;
+}
+.pb-hero .Polaris-Button--variantPrimary .Polaris-Text--root { color: inherit !important; }
+
+/* ── Stat strip — one panel, hairline-divided cells ──────────── */
+.pb-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;                 /* the gap *is* the divider */
+  background: #EFE7E3;
+  border: 1px solid #EFE7E3;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(26, 20, 38, 0.05);
+}
+@media (max-width: 900px) {
+  .pb-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.pb-stat-card {
+  background: white;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 10px;
+  text-align: left;
+  min-width: 0;             /* let long values ellipsis instead of pushing the grid */
+  transition: background 0.18s ease;
+}
+.pb-stat-card:hover { background: #FFFBF9; }
+/* Label first, value second — set by order so markup stays value-then-label. */
+.pb-stat-label {
+  order: -1;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8C8A96;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+/* Fixed figure height keeps numbers and chips on one baseline across cells. */
+.pb-stat-value,
+.pb-stat-chip {
+  display: flex;
+  align-items: center;
+  min-height: 30px;
+  max-width: 100%;
+}
+.pb-stat-value {
+  font-size: 26px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--op-ink);
+  margin: 0;
+}
+.pb-stat-chip {
+  min-height: 30px;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 0 12px;
+  border-radius: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pb-stat-chip--brand     { background: #FFF1EC; color: #B4234B; border: 1px solid #F7D8CE; }
+.pb-stat-chip--success   { background: #E9F7F0; color: #0C6B45; border: 1px solid #CCE9DB; }
+.pb-stat-chip--attention { background: #FFF6E8; color: #7A4F00; border: 1px solid #F3DFB4; }
+.pb-stat-chip--subdued   { background: #F4F4F6; color: #53535E; border: 1px solid #E6E6EA; }
+
+/* ── Feature icon tile (used in tool rows) ──── */
+.pb-feature-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: var(--op-grad-soft);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+/* ── Page header — solid card w/ gradient left bar ── */
+.pb-page-header {
+  background: #FFFFFF;
+  border: 1px solid #F1E4DE;
+  border-left: 5px solid transparent;
+  border-image: var(--op-grad) 1;
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 4px 14px rgba(244, 71, 107, 0.07);
+}
+.pb-page-header-icon {
+  width: 44px; height: 44px;
+  border-radius: 12px;
+  background: var(--op-grad);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; line-height: 1;
+  box-shadow: 0 4px 12px rgba(244, 71, 107, 0.3);
+  flex-shrink: 0;
+}
+.pb-page-header-title { font-size: 15px; font-weight: 700; color: var(--op-ink); margin: 0; }
+.pb-page-header-sub { font-size: 12px; color: var(--op-accent); opacity: 0.9; margin: 2px 0 0 0; }
+
+/* ── Step badges ────────────────────────────── */
+.pb-step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: var(--op-grad);
+  color: white;
+  font-size: 13px; font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* ══ "It is working" ═══════════════════════════════════════════════════════
+   A long run is mostly waiting on the network, so without motion the page
+   reads as frozen even while images are being processed. These are the only
+   animated elements, and they animate ONLY while a run is live. */
+
+/* Pulsing dot next to "Optimizing…" */
+.pb-live-dot {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--op-2);
+  box-shadow: 0 0 0 0 rgba(244, 71, 107, 0.55);
+  animation: pb-pulse 1.6s ease-out infinite;
+  flex-shrink: 0;
+}
+@keyframes pb-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(244, 71, 107, 0.55); }
+  70%  { box-shadow: 0 0 0 9px rgba(244, 71, 107, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(244, 71, 107, 0); }
+}
+
+/* Moving stripes over the Polaris progress bar's filled portion, so the bar
+   shows activity between one image finishing and the next. */
+.pb-running .Polaris-ProgressBar__Indicator {
+  background-image: linear-gradient(
+    115deg,
+    rgba(255, 255, 255, 0.28) 25%, transparent 25%,
+    transparent 50%, rgba(255, 255, 255, 0.28) 50%,
+    rgba(255, 255, 255, 0.28) 75%, transparent 75%
+  );
+  background-size: 22px 22px;
+  animation: pb-stripes 0.7s linear infinite;
+}
+@keyframes pb-stripes {
+  from { background-position: 0 0; }
+  to   { background-position: 22px 0; }
+}
+
+/* Per-image status chips in the live run list. */
+.pb-img-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.pb-img-status--working { background: #FFF1EC; color: #B4234B; border: 1px solid #F7D8CE; }
+.pb-img-status--done    { background: #E9F7F0; color: #0C6B45; border: 1px solid #CCE9DB; }
+.pb-img-status--failed  { background: #FDECEC; color: #9B2226; border: 1px solid #F5CFCF; }
+.pb-img-status--pending { background: #F4F4F6; color: #6B6B76; border: 1px solid #E6E6EA; }
+
+/* Respect the OS setting — motion here is decoration, never information. */
+@media (prefers-reduced-motion: reduce) {
+  .pb-live-dot,
+  .pb-running .Polaris-ProgressBar__Indicator {
+    animation: none;
+  }
+}

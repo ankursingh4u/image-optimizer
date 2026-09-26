@@ -488,6 +488,15 @@ export default function ImageOptimizationDashboard() {
       ]}
     >
       <Layout>
+        <Layout.Section>
+          <div className="pb-page-header">
+            <span className="pb-page-header-icon">📈</span>
+            <div>
+              <p className="pb-page-header-title">Optimization Dashboard</p>
+              <p className="pb-page-header-sub">Every run at a glance — what was compressed and how much was saved</p>
+            </div>
+          </div>
+        </Layout.Section>
         {loadError && (
           <Layout.Section>
             <Banner title="Error" tone="critical">

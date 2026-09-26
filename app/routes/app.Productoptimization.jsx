@@ -509,13 +509,28 @@ export default function ProductOptimization() {
       subtitle="Optimize product images with real compression and automatic replacement"
     >
       <Layout>
+        <Layout.Section>
+          <div className="pb-page-header">
+            <span className="pb-page-header-icon">⚡</span>
+            <div>
+              <p className="pb-page-header-title">Image Optimizer</p>
+              <p className="pb-page-header-sub">Real compression, per-image progress, originals replaced safely</p>
+            </div>
+          </div>
+        </Layout.Section>
         {isRunning && (
           <Layout.Section>
+            {/* pb-running drives the moving stripes on the progress bar below:
+                a run spends most of its time waiting on the network, and
+                without motion a page mid-run reads as frozen. */}
+            <div className={run.stopping ? undefined : 'pb-running'}>
             <Card>
               <BlockStack gap="300">
                 <InlineStack align="space-between" blockAlign="center" wrap={true}>
                   <InlineStack gap="300" blockAlign="center">
-                    <Spinner accessibilityLabel="Optimization in progress" size="small" />
+                    {run.stopping
+                      ? <Spinner accessibilityLabel="Finishing" size="small" />
+                      : <span className="pb-live-dot" />}
                     <Text variant="headingMd" as="h3">
                       {run.stopping
                         ? 'Finishing the images already started…'
@@ -608,6 +623,7 @@ export default function ProductOptimization() {
                 </Text>
               </BlockStack>
             </Card>
+            </div>
           </Layout.Section>
         )}
 
